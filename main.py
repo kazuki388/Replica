@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
-from collections import defaultdict, deque
-from datetime import timedelta
+from collections import deque
 from io import BytesIO
-from logging.handlers import RotatingFileHandler
-from typing import Any, Callable, Coroutine, Dict, List, Optional
-from weakref import proxy
+from typing import Any, Optional
 
 import aiofiles
 import aiofiles.os
@@ -17,24 +13,12 @@ import aioshutil
 import interactions
 import orjson
 from interactions.api.events import MemberAdd
-from interactions.client.errors import Forbidden, HTTPException, NotFound
+from interactions.client.errors import Forbidden, NotFound
 
+from .config import BASE_DIR, setup_logger
 from .lib import migrate_channel, migrate_thread
 
-BASE_DIR: str = os.path.abspath(os.path.dirname(__file__))
-LOG_FILE: str = os.path.join(BASE_DIR, "replica.log")
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    "%(asctime)s | %(process)d:%(thread)d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
-    "%Y-%m-%d %H:%M:%S.%f %z",
-)
-file_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+logger = setup_logger(__name__)
 
 
 class Model:
@@ -65,7 +49,8 @@ class Model:
             logger.error(f"Error saving state: {e}", exc_info=True)
             raise
 
-    async def get_last_state(self, file_path: str) -> dict:
+    @staticmethod
+    async def get_last_state(file_path: str) -> dict:
         try:
             async with aiofiles.open(file_path) as file:
                 raw_data = await file.read()
@@ -109,15 +94,17 @@ class Replica(interactions.Extension):
         self.CONFIG_FILE: str = os.path.join(BASE_DIR, "config.json")
         self.STATE_FILE: str = os.path.join(BASE_DIR, "state.json")
 
-        self.guild: interactions.Guild | None = None
-        self.new_guild: interactions.Guild | None = None
-        self.live_update: bool = False
-
-        self.process_delay: float = 0.2
         self.webhook_delay: float = 0.2
+        self.process_delay: float = 0.2
+        self.admin_user_id: Optional[int] = None
+        self.source_guild_id: Optional[int] = None
+        self.source_guild: Optional[interactions.Guild] = None
+        self.target_guild: Optional[interactions.Guild] = None
+
         self.webhook_semaphore = asyncio.Semaphore(5)
         self.member_semaphore = asyncio.Semaphore(10)
         self.channel_semaphore = asyncio.Semaphore(2)
+
         self.message_queue: deque[tuple] = deque(maxlen=10000)
         self.new_messages_queue: deque[tuple] = deque(maxlen=1000)
         self.processed_channels: list[int] = []
@@ -129,53 +116,39 @@ class Replica(interactions.Extension):
             "emojis": {},
             "fetched_data": {"channels": [], "roles": [], "emojis": [], "stickers": []},
         }
-        self.last_executed_method: str = ""
 
         asyncio.create_task(self.initialize_data())
 
     async def initialize_data(self) -> None:
-        await self.model.load_state(self.STATE_FILE)
         try:
+            await self.model.load_state(self.STATE_FILE)
             await self.model.load_config(self.CONFIG_FILE)
             config = self.model.mappings
+
             self.webhook_delay = config.get("webhook_delay", 0.2)
             self.process_delay = config.get("process_delay", 0.2)
-            self.live_update = config.get("live_update", False)
-            self.guild = await self.bot.fetch_guild(1150630510696075404)
-
-            if saved_guild_id := config.get("new_guild_id"):
-                try:
-                    self.new_guild = await self.bot.fetch_guild(saved_guild_id)
-                    logger.info(
-                        f"Loaded saved guild: {self.new_guild.name} ({self.new_guild.id})"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Could not load saved guild {saved_guild_id}: {e}",
-                    )
-                    self.new_guild = None
-
-            config.update(
-                {
-                    "webhook_delay": self.webhook_delay,
-                    "process_delay": self.process_delay,
-                    "live_update": self.live_update,
-                    "old_guild": self.guild.id,
-                    "new_guild": self.new_guild.id if self.new_guild else None,
-                }
+            self.admin_user_id = (
+                int(config["admin_user_id"]) if config.get("admin_user_id") else None
             )
-            self.model.mappings = config
-            await self.model.save_config(self.CONFIG_FILE)
+            self.source_guild_id = (
+                int(config["source_guild_id"])
+                if config.get("source_guild_id")
+                else None
+            )
+
+            if self.source_guild_id:
+                self.source_guild = await self.bot.fetch_guild(self.source_guild_id)
+
+            if config.get("target_guild_id"):
+                self.target_guild = await self.bot.fetch_guild(
+                    int(config["target_guild_id"])
+                )
 
         except Exception as e:
-            logger.warning(
-                f"Error loading config file, using default settings: {e}",
-            )
-            self.webhook_delay = 0.2
-            self.process_delay = 0.2
-            self.live_update = False
+            logger.warning(f"Error loading config file, using default settings: {e}")
+            self.webhook_delay = self.process_delay = 0.2
 
-    # Create
+    # Log
 
     @staticmethod
     async def create_channel_log(
@@ -195,27 +168,85 @@ class Replica(interactions.Extension):
             f"{'Deleted' if deleted else 'Created'} webhook in #{channel_name}"
         )
 
+    # Events
+    @interactions.listen(MemberAdd)
+    async def on_member_join(self, event: MemberAdd):
+        if not self.target_guild:
+            return
+
+        if event.member.id == self.admin_user_id:
+            try:
+                admin_role = next(
+                    (role for role in event.member.guild.roles if role.name == "Admin"),
+                    None,
+                )
+                if admin_role:
+                    await event.member.add_role(admin_role)
+                    logger.info(f"Added Admin role to user {event.member.id}")
+                else:
+                    logger.error("Admin role not found")
+            except Exception as e:
+                logger.error(f"Failed to add Admin role: {e}")
+
+    # Base Command
+
+    module_base: interactions.SlashCommand = interactions.SlashCommand(
+        name=interactions.LocalisedName(
+            default_locale="english_us",
+            english_us="replica",
+            chinese_china="複製",
+            chinese_taiwan="複製",
+        ),
+        description=interactions.LocalisedDesc(
+            default_locale="english_us",
+            english_us="Clone server",
+            chinese_china="複製伺服器",
+            chinese_taiwan="複製伺服器",
+        ),
+        default_member_permissions=interactions.Permissions.ADMINISTRATOR,
+    )
+
+    # Create Command
+
+    @module_base.subcommand(
+        sub_cmd_name="create", sub_cmd_description="Create a new server for cloning"
+    )
+    async def create_guild_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not self.source_guild:
+                await ctx.send("Source guild is not set.", ephemeral=True)
+                return
+
+            await self.create_new_guild()
+            await ctx.send("Successfully created new server!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error creating new guild: {e}", exc_info=True)
+            await ctx.send(
+                "An error occurred while creating new server.", ephemeral=True
+            )
+
     async def create_new_guild(self) -> None:
         try:
-            if not self.guild:
+            if not self.source_guild:
                 raise ValueError("Source guild is not set")
 
-            self.new_guild = await interactions.Guild.create(
-                name=f"{self.guild.name} (Dyad)",
+            self.target_guild = await interactions.Guild.create(
+                name=f"{self.source_guild.name} (Dyad)",
                 client=self.bot,
                 verification_level=(
-                    self.guild.verification_level
-                    if self.guild.verification_level
+                    self.source_guild.verification_level
+                    if self.source_guild.verification_level
                     else interactions.VerificationLevel.NONE
                 ),
                 default_message_notifications=(
-                    self.guild.default_message_notifications
-                    if self.guild.default_message_notifications
+                    self.source_guild.default_message_notifications
+                    if self.source_guild.default_message_notifications
                     else interactions.DefaultNotificationLevel.ALL_MESSAGES
                 ),
                 explicit_content_filter=(
-                    self.guild.explicit_content_filter
-                    if self.guild.explicit_content_filter
+                    self.source_guild.explicit_content_filter
+                    if self.source_guild.explicit_content_filter
                     else interactions.ExplicitContentFilterLevel.DISABLED
                 ),
             )
@@ -226,16 +257,16 @@ class Replica(interactions.Extension):
             except Exception:
                 current_config = {}
 
-            current_config["new_guild_id"] = str(self.new_guild.id)
+            current_config["target_guild_id"] = str(self.target_guild.id)
             self.model.mappings = current_config
 
             try:
                 await self.model.save_config(self.CONFIG_FILE)
                 logger.info(
-                    f"Created new guild: {self.new_guild.name} ({self.new_guild.id}) and saved ID to config"
+                    f"Created new guild: {self.target_guild.name} ({self.target_guild.id}) and saved ID to config"
                 )
 
-                await self.new_guild.create_role(
+                await self.target_guild.create_role(
                     name="Admin",
                     permissions=interactions.Permissions.ADMINISTRATOR,
                     color=0xFF0000,
@@ -243,11 +274,11 @@ class Replica(interactions.Extension):
                     mentionable=True,
                 )
 
-                system_channel = await self.new_guild.fetch_channel(
-                    self.new_guild.system_channel_id
+                system_channel = await self.target_guild.fetch_channel(
+                    self.target_guild.system_channel_id
                 )
-                invite = await system_channel.create_invite(max_age=86400)
-                user = await self.bot.fetch_user(1268909926458064991)
+                invite = await system_channel.create_invite()
+                user = await self.bot.fetch_user(self.admin_user_id)
                 await user.send(
                     f"Here's your invite link to the new server: {invite.link} ({invite.code})"
                 )
@@ -262,212 +293,140 @@ class Replica(interactions.Extension):
             logger.error(f"Failed to create new guild: {e}", exc_info=True)
             raise
 
-    @interactions.listen(MemberAdd)
-    async def on_member_join(self, event: MemberAdd):
-        if not self.new_guild:
-            return
+    # Clone Setting
 
-        if event.member.id == 1268909926458064991:
-            try:
-                admin_role = next(
-                    (role for role in event.member.guild.roles if role.name == "Admin"),
-                    None,
+    async def fetch_settings_data(self):
+        try:
+            if not self.source_guild:
+                raise ValueError("Source guild is not set")
+            channels = await self.source_guild.fetch_channels()
+            self.mappings["fetched_data"]["channels"] = channels
+            return True
+        except Exception as e:
+            logger.error(f"Error fetching settings data: {e}", exc_info=True)
+            return False
+
+    @module_base.subcommand(
+        sub_cmd_name="settings", sub_cmd_description="Clone server settings"
+    )
+    async def clone_settings_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_settings_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
                 )
-                if admin_role:
-                    await event.member.add_role(admin_role)
-                    logger.info(f"Added Admin role to user {event.member.id}")
-                else:
-                    logger.error("Admin role not found")
-            except Exception as e:
-                logger.error(f"Failed to add Admin role: {e}")
+                return
 
-    # Serve
-
-    async def fetch_guild_data(self) -> None:
-        if not self.guild:
-            raise ValueError("Source guild is not set")
-
-        self.mappings = {
-            "channels": {},
-            "categories": {},
-            "roles": {},
-            "emojis": {},
-            "fetched_data": {"channels": [], "roles": [], "emojis": [], "stickers": []},
-        }
-
-        try:
-            self.mappings["fetched_data"][
-                "channels"
-            ] = await self.guild.fetch_channels()
-            logger.info(
-                f"Fetched {len(self.mappings['fetched_data']['channels'])} channels"
-            )
+            success = await self.clone_settings()
+            if success:
+                await ctx.send("Successfully cloned server settings!", ephemeral=True)
+            else:
+                await ctx.send("Failed to clone server settings.", ephemeral=True)
         except Exception as e:
-            logger.error(f"Failed to fetch channels: {e}")
+            logger.error(f"Error cloning settings: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning settings.", ephemeral=True)
 
-        try:
-            self.mappings["fetched_data"]["roles"] = self.guild.roles
-            logger.info(f"Fetched {len(self.mappings['fetched_data']['roles'])} roles")
-        except Exception as e:
-            logger.error(f"Failed to fetch roles: {e}")
-
-        try:
-            self.mappings["fetched_data"][
-                "emojis"
-            ] = await self.guild.fetch_all_custom_emojis()
-            logger.info(
-                f"Fetched {len(self.mappings['fetched_data']['emojis'])} emojis"
-            )
-        except Exception as e:
-            logger.error(f"Failed to fetch emojis: {e}")
-
-        try:
-            self.mappings["fetched_data"][
-                "stickers"
-            ] = await self.guild.fetch_all_custom_stickers()
-            logger.info(
-                f"Fetched {len(self.mappings['fetched_data']['stickers'])} stickers"
-            )
-        except Exception as e:
-            logger.error(f"Failed to fetch stickers: {e}")
-
-    async def prepare_server(self) -> None:
-        if not self.new_guild:
-            logger.error("New guild is not initialized")
-            return
-
-        cleanup_methods = {
-            "roles": lambda: [
-                role for role in self.new_guild.roles if role.id != self.new_guild.id
-            ],
-            "channels": self.new_guild.fetch_channels,
-            "emojis": self.new_guild.fetch_all_custom_emojis,
-            "stickers": self.new_guild.fetch_all_custom_stickers,
-        }
-
-        for method_name, method in cleanup_methods.items():
-            logger.debug(f"Processing cleaning method: {method_name}...")
-            items = method() if method_name == "roles" else await method()
-            await self.cleanup_items(items)
-
-        self.last_executed_method = "prepare_server"
-
-    async def cleanup_items(self, items) -> None:
-        if not items:
-            return
-
-        for item in items:
-            try:
-                if hasattr(item, "delete"):
-                    await item.delete()
-                    await asyncio.sleep(self.process_delay)
-                else:
-                    logger.warning(f"Item {item} does not have delete method")
-            except HTTPException as e:
-                logger.warning(f"Failed to delete item: {e}")
-                continue
-
-        if self.new_guild is not None:
-            try:
-                await self.new_guild.edit(icon=None, banner=None, description=None)
-            except HTTPException as e:
-                logger.warning(f"Failed to reset guild settings: {e}")
+    def get_channel_from_mapping(self, channel) -> interactions.GuildText | None:
+        return self.mappings["channels"].get(channel.id) if channel else None
 
     async def clone_settings(self) -> bool:
-        if not self.guild or not self.new_guild:
+        if not self.source_guild or not self.target_guild:
             logger.error("Guild or new guild is not initialized")
             return False
 
         try:
             channels = {
                 "afk": (
-                    self.get_channel_from_mapping(self.guild.afk_channel_id)
-                    if hasattr(self.guild, "afk_channel_id")
+                    self.get_channel_from_mapping(self.source_guild.afk_channel_id)
+                    if hasattr(self.source_guild, "afk_channel_id")
                     else None
                 ),
                 "system": (
-                    self.get_channel_from_mapping(self.guild.system_channel)
-                    if hasattr(self.guild, "system_channel")
+                    self.get_channel_from_mapping(self.source_guild.system_channel)
+                    if hasattr(self.source_guild, "system_channel")
                     else None
                 ),
                 "public_updates": (
-                    self.get_channel_from_mapping(self.guild.public_updates_channel)
-                    if hasattr(self.guild, "public_updates_channel")
+                    self.get_channel_from_mapping(
+                        self.source_guild.public_updates_channel
+                    )
+                    if hasattr(self.source_guild, "public_updates_channel")
                     else None
                 ),
                 "rules": (
-                    self.get_channel_from_mapping(self.guild.rules_channel)
-                    if hasattr(self.guild, "rules_channel")
+                    self.get_channel_from_mapping(self.source_guild.rules_channel)
+                    if hasattr(self.source_guild, "rules_channel")
                     else None
                 ),
                 "safety_alerts": (
-                    self.get_channel_from_mapping(self.guild.safety_alerts_channel)
-                    if hasattr(self.guild, "safety_alerts_channel")
+                    self.get_channel_from_mapping(
+                        self.source_guild.safety_alerts_channel
+                    )
+                    if hasattr(self.source_guild, "safety_alerts_channel")
                     else None
                 ),
             }
 
-            if not channels["public_updates"]:
-                logger.error(
-                    "Can't create community: missing access to public updates channel"
-                )
-                return False
-
             try:
-                await self.new_guild.edit(
+                await self.target_guild.edit(
                     features=["COMMUNITY"],
-                    name=self.guild.name if hasattr(self.guild, "name") else None,
+                    name=(
+                        self.source_guild.name
+                        if hasattr(self.source_guild, "name")
+                        else None
+                    ),
                     description=(
-                        self.guild.description
-                        if hasattr(self.guild, "description")
+                        self.source_guild.description
+                        if hasattr(self.source_guild, "description")
                         else None
                     ),
                     verification_level=(
-                        self.guild.verification_level
-                        if hasattr(self.guild, "verification_level")
+                        self.source_guild.verification_level
+                        if hasattr(self.source_guild, "verification_level")
                         else None
                     ),
                     default_message_notifications=(
-                        self.guild.default_message_notifications
-                        if hasattr(self.guild, "default_message_notifications")
+                        self.source_guild.default_message_notifications
+                        if hasattr(self.source_guild, "default_message_notifications")
                         else None
                     ),
                     explicit_content_filter=(
-                        self.guild.explicit_content_filter
-                        if hasattr(self.guild, "explicit_content_filter")
+                        self.source_guild.explicit_content_filter
+                        if hasattr(self.source_guild, "explicit_content_filter")
                         else None
                     ),
                     afk_channel=channels["afk"],
                     afk_timeout=(
-                        self.guild.afk_timeout
-                        if hasattr(self.guild, "afk_timeout")
+                        self.source_guild.afk_timeout
+                        if hasattr(self.source_guild, "afk_timeout")
                         else None
                     ),
                     system_channel=channels["system"],
                     system_channel_flags=(
-                        self.guild.system_channel_flags
-                        if hasattr(self.guild, "system_channel_flags")
+                        self.source_guild.system_channel_flags
+                        if hasattr(self.source_guild, "system_channel_flags")
                         else None
                     ),
                     rules_channel=channels["rules"],
                     public_updates_channel=channels["public_updates"],
                     safety_alerts_channel=channels["safety_alerts"],
                     preferred_locale=(
-                        self.guild.preferred_locale
-                        if hasattr(self.guild, "preferred_locale")
+                        self.source_guild.preferred_locale
+                        if hasattr(self.source_guild, "preferred_locale")
                         else None
                     ),
                     premium_progress_bar_enabled=(
-                        self.guild.premium_progress_bar_enabled
-                        if hasattr(self.guild, "premium_progress_bar_enabled")
+                        self.source_guild.premium_progress_bar_enabled
+                        if hasattr(self.source_guild, "premium_progress_bar_enabled")
                         else False
                     ),
                 )
                 logger.debug(
-                    f"Updated settings for guild: {self.new_guild.name} ({self.new_guild.id})"
+                    f"Updated settings for guild: {self.target_guild.name} ({self.target_guild.id})"
                 )
                 await asyncio.sleep(self.process_delay)
-                self.last_executed_method = "clone_settings"
                 return True
             except Exception as e:
                 logger.error(
@@ -479,73 +438,205 @@ class Replica(interactions.Extension):
             logger.error(f"Failed to clone settings: {e}", exc_info=True)
             return False
 
+    # Clone Icon
+
+    @module_base.subcommand(
+        sub_cmd_name="icon", sub_cmd_description="Clone server icon"
+    )
+    async def clone_icon_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            await self.clone_icon()
+            await ctx.send("Successfully cloned server icon!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning icon: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning icon.", ephemeral=True)
+
     async def clone_icon(self) -> None:
         if (
-            self.guild is not None
-            and self.guild.icon is not None
-            and self.new_guild is not None
+            self.source_guild is not None
+            and self.source_guild.icon is not None
+            and self.target_guild is not None
         ):
-            await self.new_guild.edit(icon=BytesIO(await self.guild.icon.fetch()))
+            await self.target_guild.edit(
+                icon=BytesIO(await self.source_guild.icon.fetch())
+            )
         await asyncio.sleep(self.process_delay)
-        self.last_executed_method = "clone_icon"
+
+    # Clone Banner
+
+    @module_base.subcommand(
+        sub_cmd_name="banner", sub_cmd_description="Clone server banner"
+    )
+    async def clone_banner_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            await self.clone_banner()
+            await ctx.send("Successfully cloned server banner!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning banner: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning banner.", ephemeral=True)
 
     async def clone_banner(self) -> None:
         if (
-            self.guild is not None
-            and self.guild.banner is not None
-            and self.new_guild is not None
+            self.source_guild is not None
+            and self.source_guild.banner is not None
+            and self.target_guild is not None
         ):
-            await self.new_guild.edit(banner=BytesIO(await self.guild.splash.fetch()))
+            await self.target_guild.edit(
+                banner=BytesIO(await self.source_guild.splash.fetch())
+            )
             await asyncio.sleep(self.process_delay)
-        self.last_executed_method = "clone_banner"
+
+    # Clone Roles
+
+    @module_base.subcommand(
+        sub_cmd_name="roles", sub_cmd_description="Clone server roles"
+    )
+    async def clone_roles_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_roles_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await self.clone_roles()
+            await ctx.send("Successfully cloned server roles!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning roles: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning roles.", ephemeral=True)
+
+    async def fetch_roles_data(self):
+        try:
+            if not self.source_guild:
+                raise ValueError("Source guild is not set")
+            roles = []
+            for role_id in self.source_guild._role_ids:
+                role = await self.source_guild.fetch_role(role_id)
+                if role:
+                    roles.append(role)
+            self.mappings["fetched_data"]["roles"] = roles
+            return True
+        except Exception as e:
+            logger.error(f"Error fetching roles data: {e}", exc_info=True)
+            return False
 
     async def clone_roles(self):
-        roles_create = [role for role in self.mappings["fetched_data"]["roles"]]
-        self.mappings["roles"].update(
-            {
-                role.id: await self.new_guild.fetch_role(role.id)
-                for role in roles_create
-                if role.id == self.new_guild.default_role.id
-            }
-        )
+        try:
+            roles_create = [role for role in self.mappings["fetched_data"]["roles"]]
+            logger.info(f"Starting to clone {len(roles_create)} roles")
 
-        for role in reversed(roles_create):
-            if role.id == self.new_guild.default_role.id:
-                await (await self.new_guild.fetch_role(role.id)).edit(
-                    name=role.name,
-                    color=role.color,
-                    hoist=role.hoist,
-                    mentionable=role.mentionable,
-                    permissions=role.permissions,
-                    icon=role.icon,
-                    unicode_emoji=role.unicode_emoji,
-                )
-                await asyncio.sleep(self.process_delay)
-                continue
-
-            self.mappings["roles"][role.id] = new_role = (
-                await self.new_guild.create_role(
-                    name=role.name,
-                    color=role.color,
-                    hoist=role.hoist,
-                    mentionable=role.mentionable,
-                    permissions=role.permissions,
-                    icon=role.icon,
-                )
+            self.mappings["roles"].update(
+                {
+                    role.name: await self.target_guild.fetch_role(role.id)
+                    for role in roles_create
+                    if role.id == self.target_guild.default_role.id
+                }
             )
 
-            if role.unicode_emoji:
-                await new_role.edit(unicode_emoji=role.unicode_emoji)
+            for role in reversed(roles_create):
+                if role.id == self.target_guild.default_role.id:
+                    await (await self.target_guild.fetch_role(role.id)).edit(
+                        name=role.name,
+                        color=role.color,
+                        hoist=role.hoist,
+                        mentionable=role.mentionable,
+                        permissions=role.permissions,
+                        unicode_emoji=role._unicode_emoji,
+                    )
+                    await asyncio.sleep(self.process_delay)
+                    continue
+
+                try:
+                    role_icon = None
+                    if role._icon:
+                        role_icon = BytesIO(await role._icon.fetch())
+
+                    self.mappings["roles"][role.name] = new_role = (
+                        await self.target_guild.create_role(
+                            name=role.name,
+                            color=role.color,
+                            hoist=role.hoist,
+                            mentionable=role.mentionable,
+                            permissions=role.permissions,
+                            icon=role_icon,
+                        )
+                    )
+
+                    if role._unicode_emoji:
+                        await new_role.edit(unicode_emoji=role._unicode_emoji)
+                        await asyncio.sleep(self.process_delay)
+
+                    await self.create_object_log(
+                        object_type="role",
+                        object_name=new_role.name,
+                        object_id=new_role.id,
+                    )
+                except Forbidden as e:
+                    if "This server needs more boosts" in str(e):
+                        self.mappings["roles"][role.name] = new_role = (
+                            await self.target_guild.create_role(
+                                name=role.name,
+                                color=role.color,
+                                hoist=role.hoist,
+                                mentionable=role.mentionable,
+                                permissions=role.permissions,
+                            )
+                        )
+                        await self.create_object_log(
+                            object_type="role",
+                            object_name=new_role.name,
+                            object_id=new_role.id,
+                        )
+                    else:
+                        raise
+
                 await asyncio.sleep(self.process_delay)
 
-            await self.create_object_log(
-                object_type="role", object_name=new_role.name, object_id=new_role.id
+            logger.info("Successfully cloned all roles")
+        except Exception as e:
+            logger.error(f"Failed to clone roles: {e}", exc_info=True)
+            raise
+
+    # Clone Categories
+
+    async def fetch_channels_data(self):
+        try:
+            if not self.source_guild:
+                raise ValueError("Source guild is not set")
+            channels = await self.source_guild.fetch_channels()
+            self.mappings["fetched_data"]["channels"] = channels
+            return True
+        except Exception as e:
+            logger.error(f"Error fetching channels data: {e}", exc_info=True)
+            return False
+
+    @module_base.subcommand(
+        sub_cmd_name="categories", sub_cmd_description="Clone channel categories"
+    )
+    async def clone_categories_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_channels_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await self.clone_categories()
+            await ctx.send("Successfully cloned channel categories!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning categories: {e}", exc_info=True)
+            await ctx.send(
+                "An error occurred while cloning categories.", ephemeral=True
             )
-            await asyncio.sleep(self.process_delay)
-        self.last_executed_method = "clone_roles"
 
     async def clone_categories(self, perms: bool = True) -> None:
-        if not self.new_guild:
+        if not self.target_guild:
             logger.warning("New guild is not set")
             return
 
@@ -559,15 +650,17 @@ class Replica(interactions.Extension):
             overwrites = {}
             for overwrite in category.permission_overwrites:
                 if perms and isinstance(overwrite.id, interactions.Role):
-                    perm = interactions.PermissionOverwrite.for_target(overwrite.id)
-                    if overwrite.allow:
-                        perm.add_allows(overwrite.allow)
-                    if overwrite.deny:
-                        perm.add_denies(overwrite.deny)
-                    overwrites[self.mappings["roles"][overwrite.id]] = perm
+                    role_name = overwrite.id.name
+                    if role_name in self.mappings["roles"]:
+                        perm = interactions.PermissionOverwrite.for_target(overwrite.id)
+                        if overwrite.allow:
+                            perm.add_allows(overwrite.allow)
+                        if overwrite.deny:
+                            perm.add_denies(overwrite.deny)
+                        overwrites[self.mappings["roles"][role_name]] = perm
 
-            self.mappings["categories"][category.id] = new_category = (
-                await self.new_guild.create_category(
+            self.mappings["categories"][category.name] = new_category = (
+                await self.target_guild.create_category(
                     name=category.name,
                     position=category.position,
                     permission_overwrites=overwrites,
@@ -579,10 +672,32 @@ class Replica(interactions.Extension):
                 object_id=new_category.id,
             )
             await asyncio.sleep(self.process_delay)
-        self.last_executed_method = "clone_categories"
 
-    async def clone_channels(self, perms: bool = True) -> None:
-        if not self.new_guild:
+    # Clone Community Channels
+
+    @module_base.subcommand(
+        sub_cmd_name="c-channels", sub_cmd_description="Clone community channels"
+    )
+    async def clone_comm_channels_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_channels_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await self.clone_comm_channels()
+            await ctx.send("Successfully cloned forum channels!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning forums: {e}", exc_info=True)
+            await ctx.send(
+                "An error occurred while cloning forum channels.", ephemeral=True
+            )
+
+    async def clone_comm_channels(self, perms: bool = True) -> None:
+        if not self.target_guild:
             logger.warning("New guild is not set")
             return
 
@@ -592,19 +707,16 @@ class Replica(interactions.Extension):
             if isinstance(
                 c,
                 (
-                    interactions.GuildText,
-                    interactions.GuildVoice,
                     interactions.GuildForum,
                     interactions.GuildStageVoice,
-                    interactions.GuildNews,
                 ),
             )
         ]
 
         for channel in channels:
             try:
-                if self.guild:
-                    channel = await self.guild.fetch_channel(channel.id)
+                if self.source_guild:
+                    channel = await self.source_guild.fetch_channel(channel.id)
                 else:
                     logger.warning("Guild is not set")
                     continue
@@ -612,7 +724,18 @@ class Replica(interactions.Extension):
                 logger.debug(f"Can't fetch channel {channel.name} | {channel.id}")
                 continue
 
-            category = self.mappings["categories"].get(channel.parent_id)
+            category = None
+            position = 0
+            if channel.parent_id:
+                category = self.mappings["categories"].get(channel.parent_id)
+                if category:
+                    category_channels = [
+                        c
+                        for c in self.target_guild.channels
+                        if c.parent_id == category.id
+                    ]
+                    position = len(category_channels)
+
             overwrites = {}
 
             if perms and channel.permission_overwrites:
@@ -627,63 +750,48 @@ class Replica(interactions.Extension):
 
             channel_args = {
                 "name": channel.name,
-                "position": channel.position,
+                "position": position,
                 "category": category,
                 "permission_overwrites": overwrites,
             }
 
-            if isinstance(channel, interactions.GuildText):
-                self.mappings["channels"][channel.id] = new_channel = (
-                    await self.new_guild.create_text_channel(
-                        **channel_args,
-                        topic=channel.topic,
-                        rate_limit_per_user=channel.rate_limit_per_user,
-                        nsfw=channel.nsfw,
+            if isinstance(channel, interactions.GuildForum):
+                tags = []
+                for tag in channel.available_tags:
+                    emoji_data = None
+                    if tag.emoji_id:
+                        emoji_name = tag.emoji_name
+                        target_emoji = next(
+                            (
+                                emoji
+                                for emoji in self.target_guild.emojis
+                                if emoji.name == emoji_name
+                            ),
+                            None,
+                        )
+                        if target_emoji:
+                            emoji_data = {
+                                "id": target_emoji.id,
+                                "name": tag.emoji_name,
+                            }
+                    elif tag.emoji_name and not tag.emoji_id:
+                        emoji_data = {"name": tag.emoji_name}
+
+                    new_tag = interactions.ThreadTag.create(
+                        name=tag.name, moderated=tag.moderated, emoji=emoji_data
                     )
-                )
-                await self.create_channel_log(
-                    channel_type="text",
-                    channel_name=new_channel.name,
-                    channel_id=new_channel.id,
-                )
+                    tags.append(new_tag)
 
-            elif isinstance(channel, interactions.GuildVoice):
-                bitrate = (
-                    min(channel.bitrate, self.new_guild.bitrate_limit)
-                    if self.new_guild.bitrate_limit
-                    else channel.bitrate
+                new_channel = await self.target_guild.create_forum_channel(
+                    **channel_args,
+                    nsfw=channel.nsfw,
+                    layout=channel.default_forum_layout,
+                    rate_limit_per_user=channel.rate_limit_per_user,
+                    sort_order=channel.default_sort_order,
+                    available_tags=tags,
                 )
+                self.mappings["channels"][channel.name] = new_channel
 
-                self.mappings["channels"][channel.id] = new_channel = (
-                    await self.new_guild.create_voice_channel(
-                        **channel_args,
-                        bitrate=bitrate,
-                        user_limit=channel.user_limit,
-                    )
-                )
-                await self.create_channel_log(
-                    channel_type="voice",
-                    channel_name=new_channel.name,
-                    channel_id=new_channel.id,
-                )
-
-            elif isinstance(channel, interactions.GuildForum):
-                tags = channel.available_tags
-                for tag in tags:
-                    if tag.emoji and tag.emoji.id:
-                        tag.emoji = self.mappings["emojis"].get(tag.emoji.id)
-
-                self.mappings["channels"][channel.id] = new_channel = (
-                    await self.new_guild.create_forum_channel(
-                        **channel_args,
-                        topic=channel.topic,
-                        nsfw=channel.nsfw,
-                        layout=channel.default_forum_layout,
-                        rate_limit_per_user=channel.rate_limit_per_user,
-                        sort_order=channel.default_sort_order,
-                        available_tags=tags,
-                    )
-                )
                 await self.create_channel_log(
                     channel_type="forum",
                     channel_name=new_channel.name,
@@ -692,9 +800,9 @@ class Replica(interactions.Extension):
 
             elif isinstance(channel, interactions.GuildStageVoice):
                 self.mappings["channels"][channel.id] = new_channel = (
-                    await self.new_guild.create_stage_channel(
+                    await self.target_guild.create_stage_channel(
                         **channel_args,
-                        bitrate=min(channel.bitrate, self.new_guild.bitrate_limit),
+                        bitrate=min(channel.bitrate, self.target_guild.bitrate_limit),
                         user_limit=channel.user_limit,
                     )
                 )
@@ -704,14 +812,150 @@ class Replica(interactions.Extension):
                     channel_id=new_channel.id,
                 )
 
-            elif isinstance(channel, interactions.GuildNews):
-                self.mappings["channels"][channel.id] = new_channel = (
-                    await self.new_guild.create_news_channel(
-                        **channel_args,
-                        topic=channel.topic,
-                        nsfw=channel.nsfw,
-                    )
+            await asyncio.sleep(self.process_delay)
+
+    # Clone Non-Community Channels
+
+    @module_base.subcommand(
+        sub_cmd_name="nc-channels", sub_cmd_description="Clone non-community channels"
+    )
+    async def clone_non_comm_channels_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_channels_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
                 )
+                return
+
+            await self.clone_non_comm_channels()
+            await ctx.send("Successfully cloned channels!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning channels: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning channels.", ephemeral=True)
+
+    async def clone_non_comm_channels(self, perms: bool = True) -> None:
+        if not self.target_guild:
+            logger.warning("New guild is not set")
+            return
+
+        channels = [
+            c
+            for c in self.mappings["fetched_data"]["channels"]
+            if isinstance(
+                c,
+                (
+                    interactions.GuildText,
+                    interactions.GuildVoice,
+                    interactions.GuildNews,
+                ),
+            )
+        ]
+
+        for channel in channels:
+            try:
+                if self.source_guild:
+                    channel = await self.source_guild.fetch_channel(channel.id)
+                else:
+                    logger.warning("Guild is not set")
+                    continue
+            except Forbidden:
+                logger.debug(f"Can't fetch channel {channel.name} | {channel.id}")
+                continue
+
+            # 通过名称查找父分类
+            category = None
+            position = 0
+            if channel.parent_id:
+                parent_name = channel.parent.name if channel.parent else None
+                category = next(
+                    (
+                        cat
+                        for cat in self.target_guild.channels
+                        if isinstance(cat, interactions.GuildCategory)
+                        and cat.name == parent_name
+                    ),
+                    None,
+                )
+                if category:
+                    category_channels = [
+                        c
+                        for c in self.target_guild.channels
+                        if c.parent_id == category.id
+                    ]
+                    position = len(category_channels)
+
+            overwrites = {}
+            if perms and channel.permission_overwrites:
+                for overwrite in channel.permission_overwrites:
+                    if isinstance(overwrite.id, interactions.Role):
+                        role_name = overwrite.id.name
+                        target_role = next(
+                            (
+                                role
+                                for role in self.target_guild.roles
+                                if role.name == role_name
+                            ),
+                            None,
+                        )
+                        if target_role:
+                            perm = interactions.PermissionOverwrite.for_target(
+                                target_role
+                            )
+                            if overwrite.allow:
+                                perm.add_allows(overwrite.allow)
+                            if overwrite.deny:
+                                perm.add_denies(overwrite.deny)
+                            overwrites[target_role] = perm
+
+            channel_args = {
+                "name": channel.name,
+                "position": position,
+                "category": category,
+                "permission_overwrites": overwrites,
+            }
+
+            if isinstance(channel, interactions.GuildText):
+                new_channel = await self.target_guild.create_text_channel(
+                    **channel_args,
+                    topic=channel.topic,
+                    rate_limit_per_user=channel.rate_limit_per_user,
+                    nsfw=channel.nsfw,
+                )
+                self.mappings["channels"][channel.name] = new_channel
+                await self.create_channel_log(
+                    channel_type="text",
+                    channel_name=new_channel.name,
+                    channel_id=new_channel.id,
+                )
+
+            elif isinstance(channel, interactions.GuildVoice):
+                bitrate = (
+                    min(channel.bitrate, self.target_guild.bitrate_limit)
+                    if self.target_guild.bitrate_limit
+                    else channel.bitrate
+                )
+
+                new_channel = await self.target_guild.create_voice_channel(
+                    **channel_args,
+                    bitrate=bitrate,
+                    user_limit=channel.user_limit,
+                )
+                self.mappings["channels"][channel.name] = new_channel
+                await self.create_channel_log(
+                    channel_type="voice",
+                    channel_name=new_channel.name,
+                    channel_id=new_channel.id,
+                )
+
+            elif isinstance(channel, interactions.GuildNews):
+                new_channel = await self.target_guild.create_news_channel(
+                    **channel_args,
+                    topic=channel.topic,
+                    nsfw=channel.nsfw,
+                )
+                self.mappings["channels"][channel.name] = new_channel
                 await self.create_channel_log(
                     channel_type="news",
                     channel_name=new_channel.name,
@@ -720,24 +964,54 @@ class Replica(interactions.Extension):
 
             await asyncio.sleep(self.process_delay)
 
-        self.last_executed_method = "clone_channels"
+    # Clone Emojis
+
+    async def fetch_emojis_data(self):
+        try:
+            if not self.source_guild:
+                raise ValueError("Source guild is not set")
+            emojis = await self.source_guild.fetch_all_custom_emojis()
+            self.mappings["fetched_data"]["emojis"] = emojis
+            return True
+        except Exception as e:
+            logger.error(f"Error fetching emojis data: {e}", exc_info=True)
+            return False
+
+    @module_base.subcommand(
+        sub_cmd_name="emojis", sub_cmd_description="Clone server emojis"
+    )
+    async def clone_emojis_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_emojis_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await self.clone_emojis()
+            await ctx.send("Successfully cloned server emojis!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning emojis: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning emojis.", ephemeral=True)
 
     async def clone_emojis(self) -> None:
-        if not self.new_guild:
+        if not self.target_guild:
             return
 
         emoji_limit = min(
-            self.new_guild.emoji_limit - 5,
-            len(await self.new_guild.fetch_all_custom_emojis()),
+            self.target_guild.emoji_limit - 5,
+            len(await self.target_guild.fetch_all_custom_emojis()),
         )
         emoji_data = [
             (emoji.name, emoji.roles, await emoji.read())
             for emoji in self.mappings["fetched_data"]["emojis"][:emoji_limit]
-            if len(await self.new_guild.fetch_all_custom_emojis()) < emoji_limit
+            if len(await self.target_guild.fetch_all_custom_emojis()) < emoji_limit
         ]
 
         for name, roles, imagefile in emoji_data:
-            new_emoji = await self.new_guild.create_custom_emoji(
+            new_emoji = await self.target_guild.create_custom_emoji(
                 name=name, roles=roles, imagefile=imagefile
             )
             original_emoji = next(
@@ -751,13 +1025,43 @@ class Replica(interactions.Extension):
             )
             await asyncio.sleep(self.process_delay)
 
-        self.last_executed_method = "clone_emojis"
+    # Clone Stickers
+
+    async def fetch_stickers_data(self):
+        try:
+            if not self.source_guild:
+                raise ValueError("Source guild is not set")
+            stickers = await self.source_guild.fetch_all_custom_stickers()
+            self.mappings["fetched_data"]["stickers"] = stickers
+            return True
+        except Exception as e:
+            logger.error(f"Error fetching stickers data: {e}", exc_info=True)
+            return False
+
+    @module_base.subcommand(
+        sub_cmd_name="stickers", sub_cmd_description="Clone server stickers"
+    )
+    async def clone_stickers_cmd(self, ctx: interactions.SlashContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            if not await self.fetch_stickers_data():
+                await ctx.send(
+                    "Failed to fetch source guild data. Please check bot permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await self.clone_stickers()
+            await ctx.send("Successfully cloned server stickers!", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error cloning stickers: {e}", exc_info=True)
+            await ctx.send("An error occurred while cloning stickers.", ephemeral=True)
 
     async def clone_stickers(self) -> None:
-        if not self.new_guild:
+        if not self.target_guild:
             return
 
-        sticker_limit, created = self.new_guild.sticker_limit, 0
+        sticker_limit, created = self.target_guild.sticker_limit, 0
         sticker_data = [
             (s.name, s.description, await s.to_file(), s.tags, s.id, s.url)
             for s in self.mappings["fetched_data"]["stickers"][:sticker_limit]
@@ -768,7 +1072,7 @@ class Replica(interactions.Extension):
                 break
 
             try:
-                new_sticker = await self.new_guild.create_custom_sticker(
+                new_sticker = await self.target_guild.create_custom_sticker(
                     name=name, description=description, file=file, tags=tags
                 )
                 created += 1
@@ -784,198 +1088,36 @@ class Replica(interactions.Extension):
 
             await asyncio.sleep(self.process_delay)
 
-        self.last_executed_method = "clone_stickers"
-
-    def get_channel_from_mapping(self, channel) -> interactions.GuildText | None:
-        return self.mappings["channels"].get(channel.id) if channel else None
-
-    # Commands
-
-    module_base: interactions.SlashCommand = interactions.SlashCommand(
-        name=interactions.LocalisedName(
-            default_locale="english_us",
-            english_us="clone",
-            chinese_china="複製",
-            chinese_taiwan="複製",
-        ),
-        description=interactions.LocalisedDesc(
-            default_locale="english_us",
-            english_us="Clone server",
-            chinese_china="複製伺服器",
-            chinese_taiwan="複製伺服器",
-        ),
-    )
-
-    @module_base.subcommand(
-        sub_cmd_name="process", sub_cmd_description="Process server copy state"
-    )
-    @interactions.slash_option(
-        name="start",
-        description="Start copying process",
-        opt_type=interactions.OptionType.BOOLEAN,
-    )
-    @interactions.slash_option(
-        name="reset",
-        description="Reset clone progress and start fresh",
-        opt_type=interactions.OptionType.BOOLEAN,
-        required=False,
-    )
-    async def process(
-        self,
-        ctx: interactions.SlashContext,
-        start: bool = True,
-        reset: bool = False,
-    ) -> None:
-        try:
-            await ctx.defer(ephemeral=True)
-
-            if reset:
-                self.last_executed_method = ""
-                self.mappings = {}
-                await ctx.send("Clone progress has been reset.", ephemeral=True)
-                return
-
-            last_state = await self.model.get_last_state(self.STATE_FILE)
-            if last_state:
-                self.last_executed_method = last_state.get("last_method", "")
-                self.mappings = last_state.get("mappings", {})
-                if self.last_executed_method:
-                    await ctx.send(
-                        f"Resuming from last step: {self.last_executed_method}",
-                        ephemeral=True,
-                    )
-            if start and not self.mappings.get("fetched_data"):
-                await self.fetch_guild_data()
-
-            model_ref = proxy(self.model)
-
-            async def auto_save(model=model_ref, file=self.STATE_FILE):
-                try:
-                    while True:
-                        await asyncio.sleep(300)
-                        state = {
-                            "last_method": self.last_executed_method,
-                            "mappings": self.mappings,
-                        }
-                        model.mappings = state
-                        await model.save_state(file)
-                        logger.info("Auto saved clone state")
-                except asyncio.CancelledError:
-                    state = {
-                        "last_method": self.last_executed_method,
-                        "mappings": self.mappings,
-                    }
-                    model.mappings = state
-                    await model.save_state(file)
-                    logger.info("Final auto save completed")
-                    raise
-
-            save_task = asyncio.create_task(auto_save())
-
-            try:
-
-                if start:
-                    last_method = self.last_executed_method
-                    conditions_to_functions = defaultdict(lambda: [] * 10)
-
-                    def append_if_different(
-                        condition: bool, msg: str, func: Callable[..., Coroutine]
-                    ) -> None:
-                        if condition and last_method != func.__name__:
-                            conditions_to_functions[True].append((msg, func))
-
-                    conditions_to_functions[True].append(
-                        ("Creating new guild...", self.create_new_guild)
-                    )
-
-                    function_map = (
-                        (
-                            "prepare_server",
-                            (self.prepare_server, "Preparing guild to process..."),
-                        ),
-                        (
-                            "clone_settings",
-                            (self.clone_settings, "Processing settings..."),
-                        ),
-                        ("clone_icon", (self.clone_icon, "Processing icon...")),
-                        ("clone_banner", (self.clone_banner, "Processing banner...")),
-                        ("clone_roles", (self.clone_roles, "Processing roles...")),
-                        (
-                            "clone_channels",
-                            [
-                                (self.clone_categories, "Processing categories..."),
-                                (self.clone_channels, "Processing channels..."),
-                            ],
-                        ),
-                        ("clone_emojis", (self.clone_emojis, "Processing emojis...")),
-                        (
-                            "clone_stickers",
-                            (self.clone_stickers, "Processing stickers..."),
-                        ),
-                    )
-
-                    for key, value in function_map:
-                        attr = getattr(self, key, False)
-                        if isinstance(value, list):
-                            for func, msg in value:
-                                append_if_different(attr, msg, func)
-                        else:
-                            func, msg = value
-                            append_if_different(attr, msg, func)
-
-                    steps = conditions_to_functions[True]
-                    for msg, func in steps:
-                        logger.info(msg)
-                        await func()
-                        state = {
-                            "last_method": func.__name__,
-                            "mappings": self.mappings,
-                        }
-                        self.model.mappings = state
-                        await self.model.save_state(self.STATE_FILE)
-
-            finally:
-                save_task.cancel()
-                try:
-                    await save_task
-                except asyncio.CancelledError:
-                    pass
-
-            await ctx.send("Process completed.", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Process error: {e}", exc_info=True)
-            await ctx.send("An error occurred during processing.", ephemeral=True)
+    # Migrate Command
 
     @module_base.subcommand(
         sub_cmd_name="migrate", sub_cmd_description="Migrate channel across servers"
     )
     @interactions.slash_option(
-        "origin",
-        "The origin channel to migrate from",
-        interactions.OptionType.CHANNEL,
+        name="origin",
+        description="The origin channel to migrate from",
+        opt_type=interactions.OptionType.STRING,
         required=True,
+        argument_name="origin_channel",
     )
     @interactions.slash_option(
-        "server",
-        "The destination server ID to migrate to",
-        interactions.OptionType.STRING,
+        name="server",
+        description="The destination server ID to migrate to",
+        opt_type=interactions.OptionType.STRING,
         required=True,
         argument_name="destination_server",
     )
     @interactions.slash_option(
-        "channel",
-        "The destination channel ID to migrate to",
-        interactions.OptionType.CHANNEL,
+        name="channel",
+        description="The destination channel ID to migrate to",
+        opt_type=interactions.OptionType.STRING,
         required=True,
         argument_name="destination_channel",
-    )
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
     )
     async def migrate(
         self,
         ctx: interactions.SlashContext,
-        origin: interactions.GuildChannel | interactions.ThreadChannel,
+        origin_channel: str,
         destination_server: str,
         destination_channel: str,
     ) -> None:
@@ -990,6 +1132,13 @@ class Replica(interactions.Extension):
                 await ctx.send(
                     "Could not find the destination channel.", ephemeral=True
                 )
+                return
+
+            try:
+                origin = await ctx.guild.fetch_channel(origin_channel)
+            except Exception as e:
+                logger.error(f"Error fetching channels: {e}", exc_info=True)
+                await ctx.send("Error fetching channel information", ephemeral=True)
                 return
 
             valid_pairs = {
@@ -1018,7 +1167,7 @@ class Replica(interactions.Extension):
                 return
 
             await ctx.send(
-                f"Migrating {origin.mention} to {destination.mention} in server {destination_guild.name}...",
+                f"Migrating {origin.name} to {destination.name} in server {destination_guild.name}...",
                 ephemeral=True,
             )
 
@@ -1027,18 +1176,11 @@ class Replica(interactions.Extension):
                     origin,
                     destination,
                     ctx.bot,
-                    self.mappings,
-                    ctx.guild.id,
-                    destination_guild.id,
                 )
             else:
                 await migrate_thread(
                     origin,
                     destination,
-                    ctx.bot,
-                    self.mappings,
-                    ctx.guild.id,
-                    destination_guild.id,
                 )
 
             await ctx.channel.send("Migration completed!")
@@ -1058,36 +1200,46 @@ class Replica(interactions.Extension):
                 "Something went wrong. Please contact the admin!", ephemeral=True
             )
 
+    # Configure Command
+
     @module_base.subcommand(
         sub_cmd_name="config", sub_cmd_description="Configure clone settings"
     )
     @interactions.slash_option(
-        name="live",
-        description="Enable/disable live message updates",
-        opt_type=interactions.OptionType.BOOLEAN,
-        argument_name="live_update",
-    )
-    @interactions.slash_option(
-        name="webhook_delay",
+        name="webhook",
         description="Set webhook delay (in seconds)",
         opt_type=interactions.OptionType.NUMBER,
-        required=False,
+        argument_name="webhook_delay",
     )
     @interactions.slash_option(
-        name="process_delay",
+        name="process",
         description="Set process delay (in seconds)",
         opt_type=interactions.OptionType.NUMBER,
-        required=False,
+        argument_name="process_delay",
     )
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
+    @interactions.slash_option(
+        name="admin_user_id",
+        description="Set admin user ID",
+        opt_type=interactions.OptionType.STRING,
+    )
+    @interactions.slash_option(
+        name="source_guild_id",
+        description="Set source guild ID",
+        opt_type=interactions.OptionType.STRING,
+    )
+    @interactions.slash_option(
+        name="target_guild_id",
+        description="Set target guild ID",
+        opt_type=interactions.OptionType.STRING,
     )
     async def config(
         self,
         ctx: interactions.SlashContext,
-        live_update: Optional[bool] = None,
         webhook_delay: Optional[float] = None,
         process_delay: Optional[float] = None,
+        admin_user_id: Optional[str] = None,
+        source_guild_id: Optional[str] = None,
+        target_guild_id: Optional[str] = None,
     ) -> None:
         await ctx.defer(ephemeral=True)
 
@@ -1110,10 +1262,6 @@ class Replica(interactions.Extension):
             logger.error(f"Error loading config: {e}", exc_info=True)
             current_config = {}
 
-        if live_update is not None:
-            current_config["live_update"] = live_update
-            self.live_update = live_update
-
         if webhook_delay is not None:
             current_config["webhook_delay"] = webhook_delay
             self.webhook_delay = webhook_delay
@@ -1122,12 +1270,32 @@ class Replica(interactions.Extension):
             current_config["process_delay"] = process_delay
             self.process_delay = process_delay
 
+        if admin_user_id is not None:
+            current_config["admin_user_id"] = admin_user_id
+            self.admin_user_id = int(admin_user_id)
+
+        if source_guild_id is not None:
+            current_config["source_guild_id"] = source_guild_id
+            self.source_guild_id = int(source_guild_id)
+            self.source_guild = await self.bot.fetch_guild(self.source_guild_id)
+
+        if target_guild_id is not None:
+            current_config["target_guild_id"] = target_guild_id
+            self.target_guild = await self.bot.fetch_guild(int(target_guild_id))
+
         current_config.update(
             {
-                "live_update": self.live_update,
                 "webhook_delay": self.webhook_delay,
                 "process_delay": self.process_delay,
-                "new_guild_id": str(self.new_guild.id) if self.new_guild else None,
+                "target_guild_id": (
+                    str(self.target_guild.id) if self.target_guild else None
+                ),
+                "source_guild_id": (
+                    str(self.source_guild_id) if self.source_guild_id else None
+                ),
+                "admin_user_id": (
+                    str(self.admin_user_id) if self.admin_user_id else None
+                ),
             }
         )
 
@@ -1136,13 +1304,11 @@ class Replica(interactions.Extension):
             await self.model.save_config(self.CONFIG_FILE)
 
             settings = [
-                f"Live Update: {current_config.get('live_update', False)}",
-                f"Webhook Delay: {current_config.get('webhook_delay', 0.2)}",
-                f"Process Delay: {current_config.get('process_delay', 0.2)}",
-                f"New Messages: {current_config.get('new_messages_enabled', False)}",
-                f"Fetch Channels: {current_config.get('fetch_channels', True)}",
-                f"Old Guild: {current_config.get('guild', None)}",
-                f"New Guild: {current_config.get('new_guild_id', None)}",
+                f"Webhook Delay: {current_config.get('webhook_delay', 0.2)}s",
+                f"Process Delay: {current_config.get('process_delay', 0.2)}s",
+                f"Source Guild ID: {current_config.get('source_guild_id', None)}",
+                f"Target Guild ID: {current_config.get('target_guild_id', None)}",
+                f"Admin User ID: {current_config.get('admin_user_id', None)}",
             ]
 
             await ctx.send(
@@ -1155,6 +1321,8 @@ class Replica(interactions.Extension):
             await ctx.send(
                 "An error occurred while saving the configuration.", ephemeral=True
             )
+
+    # Export Command
 
     @module_base.subcommand(
         sub_cmd_name=interactions.LocalisedName(
@@ -1187,9 +1355,6 @@ class Replica(interactions.Extension):
         opt_type=interactions.OptionType.STRING,
         autocomplete=True,
         argument_name="file_type",
-    )
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
     )
     async def debug_export(
         self, ctx: interactions.SlashContext, file_type: str
@@ -1317,6 +1482,12 @@ class Replica(interactions.Extension):
 
         await ctx.send(choices[:25])
 
+    # Invite Command
+
+    @staticmethod
+    def validate_duration(duration: int) -> bool:
+        return 1 <= duration <= 168
+
     @module_base.subcommand(
         sub_cmd_name="invite",
         sub_cmd_description="Generate an invite link for the server",
@@ -1332,16 +1503,18 @@ class Replica(interactions.Extension):
         name="duration",
         description="Invite duration in hours (default: 24, max: 168)",
         opt_type=interactions.OptionType.INTEGER,
-        required=False,
-        min_value=1,
-        max_value=168,
-    )
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.CREATE_INSTANT_INVITE
     )
     async def generate_invite(
         self, ctx: interactions.SlashContext, server: str, duration: int = 24
     ) -> None:
+        if not server.isdigit():
+            await ctx.send("Invalid server ID format", ephemeral=True)
+            return
+
+        if not self.validate_duration(duration):
+            await ctx.send("Duration must be between 1 and 168 hours", ephemeral=True)
+            return
+
         await ctx.defer(ephemeral=True)
 
         try:
@@ -1386,9 +1559,6 @@ class Replica(interactions.Extension):
 
             invite = await channel.create_invite(
                 max_age=max_age,
-                max_uses=0,
-                temporary=False,
-                unique=True,
                 reason=f"Invite generated by {ctx.author.display_name}",
             )
 
@@ -1420,7 +1590,9 @@ class Replica(interactions.Extension):
                 {"name": f"{guild.name} ({guild.id})", "value": str(guild.id)}
             )
 
-        await ctx.send(choices)
+        await ctx.send(choices[:25])
+
+    # Delete Command
 
     @module_base.subcommand(
         sub_cmd_name="delete",
@@ -1433,23 +1605,11 @@ class Replica(interactions.Extension):
         required=True,
         autocomplete=True,
     )
-    @interactions.slash_default_member_permission(
-        interactions.Permissions.ADMINISTRATOR
-    )
     async def delete_server(self, ctx: interactions.SlashContext, server: str) -> None:
         await ctx.defer(ephemeral=True)
 
         try:
             target_guild = await self.bot.fetch_guild(server)
-            member = await target_guild.fetch_member(ctx.author.id)
-            if not member or not member.has_permission(
-                interactions.Permissions.ADMINISTRATOR
-            ):
-                await ctx.send(
-                    "You must have Administrator permission in the target server to delete it.",
-                    ephemeral=True,
-                )
-                return
 
             await target_guild.delete()
 
@@ -1478,63 +1638,4 @@ class Replica(interactions.Extension):
                 {"name": f"{guild.name} ({guild.id})", "value": str(guild.id)}
             )
 
-        await ctx.send(choices)
-
-    # Utility
-
-    @staticmethod
-    def truncate_string(
-        string: str, length: int, replace_newline_with: str = " "
-    ) -> str:
-        return (
-            (s := string.replace("\n", replace_newline_with))[: length - 3].strip()
-            + "..."
-            if len(s := string.replace("\n", replace_newline_with)) > length
-            else s.strip()
-        )
-
-    @staticmethod
-    def split_messages_by_channel(
-        messages_queue: deque,
-    ) -> Dict[interactions.GuildText, List[Any]]:
-        channel_messages_map: Dict[interactions.GuildText, List[Any]] = defaultdict(
-            list
-        )
-        while messages_queue:
-            channel, message = messages_queue.popleft()
-            channel_messages_map[channel].append(message)
-        return dict(channel_messages_map)
-
-    @staticmethod
-    def format_time(delta: timedelta) -> str:
-        time_parts = (
-            ("year", delta.days // 365),
-            ("day", delta.days % 365),
-            ("hour", delta.seconds // 3600),
-            ("minute", (delta.seconds % 3600) // 60),
-            ("second", delta.seconds % 60),
-        )
-        return " ".join(f"{v} {n}{'s' if v != 1 else ''}" for n, v in time_parts if v)
-
-    @staticmethod
-    async def retry_with_backoff(coro, max_retries=3, base_delay=1, max_delay=60):
-        for attempt in range(max_retries):
-            try:
-                return await coro
-            except HTTPException as e:
-                if e.status == 429:
-                    retry_after = min(
-                        float(e.response.headers.get("Retry-After", base_delay))
-                        * (2**attempt),
-                        max_delay,
-                    )
-                    logger.warning(f"Rate limited, waiting {retry_after}s before retry")
-                    await asyncio.sleep(retry_after)
-                    continue
-                raise
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                logger.warning(f"Attempt {attempt + 1} failed: {e}", exc_info=True)
-                await asyncio.sleep(base_delay * (2**attempt))
-        return await coro
+        await ctx.send(choices[:25])
