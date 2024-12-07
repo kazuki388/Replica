@@ -117,37 +117,6 @@ class Replica(interactions.Extension):
             "fetched_data": {"channels": [], "roles": [], "emojis": [], "stickers": []},
         }
 
-        asyncio.create_task(self.initialize_data())
-
-    async def initialize_data(self) -> None:
-        try:
-            await self.model.load_state(self.STATE_FILE)
-            await self.model.load_config(self.CONFIG_FILE)
-            config = self.model.mappings
-
-            self.webhook_delay = config.get("webhook_delay", 0.2)
-            self.process_delay = config.get("process_delay", 0.2)
-            self.admin_user_id = (
-                int(config["admin_user_id"]) if config.get("admin_user_id") else None
-            )
-            self.source_guild_id = (
-                int(config["source_guild_id"])
-                if config.get("source_guild_id")
-                else None
-            )
-
-            if self.source_guild_id:
-                self.source_guild = await self.bot.fetch_guild(self.source_guild_id)
-
-            if config.get("target_guild_id"):
-                self.target_guild = await self.bot.fetch_guild(
-                    int(config["target_guild_id"])
-                )
-
-        except Exception as e:
-            logger.warning(f"Error loading config file, using default settings: {e}")
-            self.webhook_delay = self.process_delay = 0.2
-
     # Log
 
     @staticmethod
@@ -205,6 +174,44 @@ class Replica(interactions.Extension):
         ),
         default_member_permissions=interactions.Permissions.ADMINISTRATOR,
     )
+
+    # Initialize Command
+
+    @module_base.subcommand(
+        sub_cmd_name="initialize",
+        sub_cmd_description="Initialize bot configuration and data",
+    )
+    async def initialize_data(self, ctx: interactions.SlashContext) -> None:
+        try:
+            await self.model.load_state(self.STATE_FILE)
+            await self.model.load_config(self.CONFIG_FILE)
+            config = self.model.mappings
+
+            self.webhook_delay = config.get("webhook_delay", 0.2)
+            self.process_delay = config.get("process_delay", 0.2)
+            self.admin_user_id = (
+                int(config["admin_user_id"]) if config.get("admin_user_id") else None
+            )
+            self.source_guild_id = (
+                int(config["source_guild_id"])
+                if config.get("source_guild_id")
+                else None
+            )
+
+            if self.source_guild_id:
+                self.source_guild = await self.bot.fetch_guild(self.source_guild_id)
+
+            if config.get("target_guild_id"):
+                self.target_guild = await self.bot.fetch_guild(
+                    int(config["target_guild_id"])
+                )
+
+            await ctx.send("Successfully initialized bot configuration and data")
+
+        except Exception as e:
+            logger.warning(f"Error loading config file, using default settings: {e}")
+            self.webhook_delay = self.process_delay = 0.2
+            await ctx.send(f"Error initializing: {e}")
 
     # Create Command
 
