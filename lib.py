@@ -1,34 +1,13 @@
-import logging
-import os
-from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional, Union, cast
+from typing import Optional, Union, cast
 
 import interactions
 
-BASE_DIR: str = os.path.abspath(os.path.dirname(__file__))
-LOG_FILE: str = os.path.join(BASE_DIR, "replica-lib.log")
+from .config import setup_logger
 
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    "%(asctime)s | %(process)d:%(thread)d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
-    "%Y-%m-%d %H:%M:%S.%f %z",
-)
-file_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
+logger = setup_logger(__name__)
 
 webhook_name: str = "Dyad Webhook"
 webhook_avatar: interactions.Absent[interactions.UPLOADABLE_TYPE] = interactions.MISSING
-
-
-ChannelMapping = Dict[int, Any]
-RoleMapping = Dict[int, Any]
-Mappings = Dict[str, Union[ChannelMapping, RoleMapping]]
 MESSAGE_LEN_LIMIT: int = 2000
 
 
@@ -115,11 +94,7 @@ async def migrate_message(
     orig_msg: interactions.Message,
     dest_chan: interactions.GuildChannel,
     thread_id: Optional[int] = None,
-    mappings: Optional[Mappings] = None,
-    orig_guild_id: Optional[int] = None,
-    new_guild_id: Optional[int] = None,
 ) -> tuple[bool, Optional[int], Optional[interactions.Message]]:
-
     if not isinstance(dest_chan, (interactions.GuildText, interactions.GuildForum)):
         return False, None, None
 
@@ -131,7 +106,12 @@ async def migrate_message(
     thread: interactions.Snowflake_Type = (
         thread_id if thread_id and thread_id != 0 else None
     )
-    thread_name: Optional[str] = orig_msg.channel.name if thread_id == 0 else None
+    thread_name: Optional[str] = (
+        orig_msg.channel.name
+        if thread_id == 0
+        or (isinstance(dest_chan, interactions.GuildForum) and not thread_id)
+        else None
+    )
     output_thread_id: Optional[int] = None
 
     if (reply_to := orig_msg.get_referenced_message()) and reply_to.type in {
@@ -145,25 +125,6 @@ async def migrate_message(
             else reply_to.content
         ).splitlines()
         msg_text = f"> {reply_to.author.display_name} at {reply_to.created_at.strftime('%d/%m/%Y %H:%M')} said:\n{chr(10).join('> ' + line for line in reply_lines)}\n{msg_text}"
-
-    if mappings and orig_guild_id and new_guild_id:
-        replacements = {
-            **{
-                f"<#{old_id}>": f"<#{new.id if new and hasattr(new, 'id') else ''}>"
-                for old_id, new in mappings.get("channels", {}).items()
-            },
-            **{
-                f"<@&{old_id}>": f"<@&{new.id if new and hasattr(new, 'id') else ''}>"
-                for old_id, new in mappings.get("roles", {}).items()
-            },
-            **{
-                f"https://discord.com/channels/{orig_guild_id}/{old_id}": f"https://discord.com/channels/{new_guild_id}/{new.id if new and hasattr(new, 'id') else old_id}"
-                for old_id, new in mappings.get("channels", {}).items()
-            },
-        }
-
-        for old_text, new_text in replacements.items():
-            msg_text = msg_text.replace(old_text, new_text)
 
     msg_text = (
         f"{chr(10).join(a.url for a in orig_msg.attachments)}\n{msg_text}"
@@ -258,29 +219,18 @@ def is_empty_message(msg: interactions.Message) -> bool:
 async def migrate_thread(
     orig_thread: interactions.ThreadChannel,
     dest_chan: Union[interactions.GuildText, interactions.GuildForum],
-    client: interactions.Client,
-    mappings: Optional[Mappings] = None,
-    orig_guild_id: Optional[int] = None,
-    new_guild_id: Optional[int] = None,
 ) -> None:
     thread_type_valid = (
         isinstance(orig_thread, interactions.GuildForumPost)
         and isinstance(dest_chan, interactions.GuildForum)
     ) or (
         (
-            isinstance(
-                orig_thread,
-                (interactions.GuildPublicThread, interactions.GuildPrivateThread),
-            )
+            isinstance(orig_thread, interactions.GuildPublicThread)
             and not isinstance(orig_thread, interactions.GuildForumPost)
         )
         and isinstance(dest_chan, interactions.GuildText)
     )
-
     if not thread_type_valid:
-        logger.warning(
-            f"Thread type mismatch: orig_thread={orig_thread.__class__.__name__}, dest_chan={dest_chan.__class__.__name__}"
-        )
         return
 
     history_list: list[interactions.Message] = await flatten_history_iterator(
@@ -296,19 +246,14 @@ async def migrate_thread(
             else None
         )
     )
-
-    thread_id: Optional[int] = None
-
-    if parent_msg is not None and parent_msg in history_list:
-        if isinstance(orig_thread, interactions.GuildForumPost):
-            ok, thread_id, _ = await migrate_message(
-                parent_msg, dest_chan, None, mappings, orig_guild_id, new_guild_id
-            )
+    if parent_msg is None and not any(
+        isinstance(orig_thread, t)
+        for t in (interactions.GuildForumPost, interactions.GuildPublicThread)
+    ):
+        return
 
     webhook = await fetch_create_webhook(dest_chan=dest_chan)
-
-    if thread_id is None:
-        thread_id = 0
+    thread_id: int = 0
 
     if parent_msg is None:
         sent_msg = await webhook.send(
@@ -326,8 +271,7 @@ async def migrate_thread(
             if isinstance(dest_chan, interactions.GuildForum)
             else (
                 await sent_msg.create_thread(
-                    name=orig_thread.name,
-                    reason="Message migration",
+                    name=orig_thread.name, reason="Message migration"
                 )
             ).id
         )
@@ -336,17 +280,10 @@ async def migrate_thread(
         if i == 0 and parent_msg is not None and msg != parent_msg:
             if isinstance(orig_thread, interactions.GuildForumPost):
                 ok, thread_id, _ = await migrate_message(
-                    parent_msg,
-                    dest_chan,
-                    thread_id,
-                    mappings,
-                    orig_guild_id,
-                    new_guild_id,
+                    parent_msg, dest_chan, thread_id
                 )
             elif isinstance(orig_thread, interactions.GuildPublicThread):
-                _, _, sent_msg = await migrate_message(
-                    parent_msg, dest_chan, None, mappings, orig_guild_id, new_guild_id
-                )
+                _, _, sent_msg = await migrate_message(parent_msg, dest_chan)
                 thread_id = (
                     await sent_msg.create_thread(
                         name=orig_thread.name, reason="Message migration"
@@ -354,42 +291,25 @@ async def migrate_thread(
                 ).id
 
         if not is_empty_message(msg):
-            ok, new_thread_id, _ = await migrate_message(
-                msg, dest_chan, thread_id, mappings, orig_guild_id, new_guild_id
-            )
-            if new_thread_id:
-                thread_id = new_thread_id
-
-    try:
-        if thread_id and isinstance(dest_chan, interactions.GuildText):
-            thread = await client.fetch_thread(thread_id)
-            if thread:
-                if orig_thread.archived:
-                    await thread.archive()
-                if orig_thread.locked:
-                    await thread.lock()
-                if orig_thread.auto_archive_duration:
-                    await thread.edit(
-                        auto_archive_duration=orig_thread.auto_archive_duration
-                    )
-    except Exception as e:
-        logger.warning(f"Failed to update thread metadata: {str(e)}")
+            ok, new_thread_id, _ = await migrate_message(msg, dest_chan, thread_id)
+            if not ok and new_thread_id is None:
+                break
+            thread_id = new_thread_id or thread_id
 
 
 async def migrate_channel(
     orig_chan: Union[interactions.GuildText, interactions.GuildForum],
     dest_chan: Union[interactions.GuildText, interactions.GuildForum],
     client: interactions.Client,
-    mappings: Optional[Mappings] = None,
-    orig_guild_id: Optional[int] = None,
-    new_guild_id: Optional[int] = None,
 ) -> None:
     match (
         isinstance(orig_chan, interactions.GuildForum),
         isinstance(dest_chan, interactions.GuildForum),
     ):
         case (True, True):
-            orig_chan = cast(interactions.GuildForum, orig_chan)
+            orig_chan: interactions.GuildForum = cast(
+                interactions.GuildForum, orig_chan
+            )
             archived_posts_id: list[int] = [
                 int(thread["id"])
                 for thread in (
@@ -406,30 +326,20 @@ async def migrate_channel(
             ]
 
             for post in posts:
-                await migrate_thread(
-                    post, dest_chan, client, mappings, orig_guild_id, new_guild_id
-                )
+                await migrate_thread(post, dest_chan)
 
         case (False, False) if isinstance(orig_chan, interactions.GuildText):
-            text_chan = cast(interactions.GuildText, orig_chan)
-            messages = await flatten_history_iterator(
-                text_chan.history(0), reverse=True
+            orig_chan: interactions.GuildText = cast(interactions.GuildText, orig_chan)
+            messages: list[interactions.Message] = await flatten_history_iterator(
+                orig_chan.history(0), reverse=True
             )
 
             for msg in messages:
-                if msg.thread:
-                    await migrate_thread(
-                        msg.thread,
-                        dest_chan,
-                        client,
-                        mappings,
-                        orig_guild_id,
-                        new_guild_id,
-                    )
-                else:
-                    await migrate_message(
-                        msg, dest_chan, None, mappings, orig_guild_id, new_guild_id
-                    )
+                (
+                    await migrate_thread(msg.thread, dest_chan)
+                    if msg.thread
+                    else await migrate_message(msg, dest_chan)
+                )
 
         case _:
             return
