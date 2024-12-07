@@ -1,44 +1,133 @@
-- [中文](#discord机器人框架模块模板)
-- [English](#discord-bot-framework-module-template)
+# Replica
 
-# Discord机器人框架模块模板
-这是针对[Discord机器人内核](https://github.com/retr0-init/Discord-Bot-Framework-Kernel.git)配套的模块模板。其开发可以参考[interactions.py](https://interactions-py.github.io/interactions.py/)。
+The **Replica** module is a powerful Discord bot designed to clone and migrate servers, channels, and content across Discord servers. It provides comprehensive functionality for duplicating server settings, roles, channels, emojis, stickers, and messages.
 
-## 开发中需要考虑的事
-- 模块主要点在[`main.py`](main.py)中。
-- 所有主要的工作都应该在继承自`interactions.Extension`的类中进行。
-- 最好在指令基或指令组中定义你的命令。
-- 命令名不能：
-    - 是大写。
-    - 包含除下划线`_`之外的特殊符号。
-    - 包括空格。
-- 你可以用另一个`.py`文件来定义内部模块函数。这个文件需要与`main.py`同级。注意你要像以下来引入内部模块：
-```python
-from . import xxx # xxx是内部模块的名字
+## Features
+
+- Complete server cloning
+  - Server settings (name, icon, banner, verification level, etc.)
+  - Categories and channels (text, voice, forum, stage)
+  - Roles and permissions
+  - Emojis and stickers
+  - Messages and threads
+  - Webhooks
+
+- Channel migration
+  - Text channel to text channel
+  - Forum to forum
+  - Public thread to text channel
+  - Forum post to forum
+
+- Customizable delays
+  - Webhook delay (0.1-5.0 seconds)
+  - Process delay (0.1-5.0 seconds)
+
+- Rate limiting
+  - 5 concurrent webhooks
+  - 10 concurrent member operations
+  - 2 concurrent channel operations
+
+## Commands
+
+### Base Command
+
+- `/replica`: Base command for all replica operations
+
+### Server Commands
+
+- `/replica create`: Create a new server for cloning
+  - Creates a new server with basic settings
+  - Automatically generates an invite link
+  - Sets up admin role
+
+- `/replica delete`: Delete a managed server
+  - `server` (choice, required): Server to delete
+
+- `/replica invite`: Generate server invite
+  - `server` (choice, required): Target server
+  - `duration` (integer, optional): Invite duration in hours (1-168, default: 24)
+
+### Cloning Commands
+
+- `/replica settings`: Clone server settings
+  - Copies server-wide configurations
+  - Includes verification levels and notification settings
+
+- `/replica icon`: Clone server icon
+  - Transfers server icon to the target server
+
+- `/replica banner`: Clone server banner
+  - Transfers server banner to the target server
+
+- `/replica roles`: Clone server roles
+  - Duplicates role hierarchy
+  - Preserves permissions and colors
+  - Maintains role icons (if available)
+
+- `/replica categories`: Clone channel categories
+  - Creates category structure
+  - Preserves category permissions
+
+- `/replica c-channels`: Clone community channels
+  - Clones forum channels
+  - Duplicates stage channels
+  - Preserves channel settings and permissions
+
+- `/replica nc-channels`: Clone non-community channels
+  - Clones text channels
+  - Duplicates voice channels
+  - Copies announcement channels
+  - Maintains channel permissions and settings
+
+- `/replica emojis`: Clone server emojis
+  - Transfers custom emojis
+  - Preserves emoji names and roles
+
+- `/replica stickers`: Clone server stickers
+  - Copies custom stickers
+  - Maintains sticker metadata
+
+### Migration Command
+
+- `/replica migrate`: Migrate channel content
+  - `origin` (string, required): Source channel ID
+  - `server` (string, required): Destination server ID
+  - `channel` (string, required): Destination channel ID
+
+### Configuration Command
+
+- `/replica config`: Configure bot settings
+  - `webhook` (float, optional): Set webhook delay
+  - `process` (float, optional): Set process delay
+  - `admin_user_id` (string, optional): Set admin user ID
+  - `source_guild_id` (string, optional): Set source guild ID
+  - `target_guild_id` (string, optional): Set target guild ID
+
+### Debug Command
+
+- `/replica export`: Export extension files
+  - `type` (choice, required): Type of files to export
+    - All Files
+    - Individual files from extension directory
+
+## Configuration
+
+Key configuration options in `config.json`:
+
+```json
+{
+  "webhook_delay": 0.2,
+  "process_delay": 0.2,
+  "admin_user_id": "YOUR_ADMIN_ID",
+  "source_guild_id": "SOURCE_SERVER_ID",
+  "target_guild_id": "TARGET_SERVER_ID"
+}
 ```
-- 只能读写模块本地的文件。如果要读写本地文件，路径为`f"{os.path.dirname{__file__}/<文件名>"`.
-- 在[`requirements.txt`](requirements.txt)中写入模块所需的第三方库。
-- 在[`CHANGELOG`](CHANGELOG)中更新改动。
-- 在机器人内核文件夹以外的文件访问会被拒绝。
-- 外部程序执行会被拒绝。
 
-# Discord-Bot-Framework-Module-Template
-This is the module template for [Discord-Bot-Framework-Kernel](https://github.com/retr0-init/Discord-Bot-Framework-Kernel.git). The development refers to [interactions.py](https://interactions-py.github.io/interactions.py/).
+### Files
 
-## Things to consider for development
-- The module's entry point is in [`main.py`](main.py).
-- Do all the main work in the class inherited from `interactions.Extension`.
-- It's better to define your commands under either a command base or group.
-- The command name CANNOT be:
-    - Uppercase.
-    - Containing special characters other than underscore (`_`).
-    - Containing space.
-- You can use another `.py` file for internal module under the same directory as `main.py`. Be aware that you need to import it like
-```python
-from . import xxx # xxx is the internal module script name
-```
-- Only local files in the module directory can be read/written. THe path to the file is `f"{os.path.dirname{__file__}/<filename>` to interact with local files.
-- Put python module requirements in [`requirements.txt`](requirements.txt). Do NOT delete this file.
-- Update your changes in [`CHANGELOG`](CHANGELOG).
-- The file access to the files other than the kernel directory will be denied.
-- The external program execution will be denied.
+The module uses several files for operation:
+
+- `config.json`: Bot configuration settings
+- `state.json`: Current state and mappings
+- `replica.log`: Operation logs
