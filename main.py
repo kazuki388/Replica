@@ -752,7 +752,7 @@ class Clone(interactions.Extension):
     @interactions.slash_option(
         "channel",
         "The destination channel ID to migrate to",
-        interactions.OptionType.STRING,
+        interactions.OptionType.CHANNEL,
         required=True,
         argument_name="destination_channel",
     )
@@ -762,7 +762,7 @@ class Clone(interactions.Extension):
     async def migrate(
         self,
         ctx: interactions.SlashContext,
-        origin: interactions.GuildChannel,
+        origin: interactions.GuildChannel | interactions.ThreadChannel,
         destination_server: str,
         destination_channel: str,
     ) -> None:
@@ -813,19 +813,19 @@ class Clone(interactions.Extension):
                 await migrate_channel(
                     origin,
                     destination,
+                    ctx.bot,
                     self.mappings,
                     ctx.guild.id,
                     destination_guild.id,
-                    ctx.bot,
                 )
             else:
                 await migrate_thread(
                     origin,
                     destination,
+                    ctx.bot,
                     self.mappings,
                     ctx.guild.id,
                     destination_guild.id,
-                    ctx.bot,
                 )
 
             await ctx.channel.send("Migration completed!")
