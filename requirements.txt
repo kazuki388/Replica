@@ -1,0 +1,4 @@
+aiofiles
+aioshutil
+discord-py-interactions
+orjson
