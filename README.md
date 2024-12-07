@@ -1,114 +1,116 @@
 # Replica
 
-The **Replica** module is a powerful Discord bot designed to clone and migrate servers, channels, and content across Discord servers. It provides comprehensive functionality for duplicating server settings, roles, channels, emojis, stickers, and messages.
+The **Replica** module is designed to replicate and migrate server configurations, role hierarchies, channel structures, custom assets, and message content between Discord guilds.
+
+> [!NOTE]
+> `lib.py`: derived from [libdiscord-ipy-migrate](https://github.com/retr0-init/libdiscord-ipy-migrate) with cross-server migration capabilities
 
 ## Features
 
-- Complete server cloning
-  - Server settings (name, icon, banner, verification level, etc.)
-  - Categories and channels (text, voice, forum, stage)
-  - Roles and permissions
-  - Emojis and stickers
-  - Messages and threads
-  - Webhooks
+- Full Server Replication
+  - Guild configurations (name, icon, banner, verification level, etc.)
+  - Channel hierarchy (categories, text, voice, forum, stage)
+  - Role structure and permission mappings
+  - Custom assets (emojis, stickers)
+  - Message content and thread structures
+  - Webhook configurations
 
-- Channel migration
-  - Text channel to text channel
-  - Forum to forum
-  - Public thread to text channel
-  - Forum post to forum
-
-- Customizable delays
-  - Webhook delay (0.1-5.0 seconds)
-  - Process delay (0.1-5.0 seconds)
-
-- Rate limiting
-  - 5 concurrent webhooks
-  - 10 concurrent member operations
-  - 2 concurrent channel operations
+- Cross-Server Channel Migration
+  - Text channel to text channel transfer
+  - Forum channel replication
+  - Thread to text channel conversion
+  - Forum post migration
 
 ## Commands
 
 ### Base Command
 
-- `/replica`: Base command for all replica operations
+- `/replica`: Root command for all replica operations
+
+### Initialization Command
+
+- `/replica initialize`: Bootstrap bot configuration and state
+  - Loads parameters from config.json
+  - Establishes webhook and process delays
+  - Sets critical admin and guild identifiers
 
 ### Server Commands
 
-- `/replica create`: Create a new server for cloning
-  - Creates a new server with basic settings
-  - Automatically generates an invite link
-  - Sets up admin role
+- `/replica create`: Initialize new target server
+  - Establishes base server configuration
+  - Generates invite URL
+  - Configures administrative role
 
-- `/replica delete`: Delete a managed server
-  - `server` (choice, required): Server to delete
+- `/replica delete`: Remove managed server
+  - `server` (choice, required): Target server identifier
 
-- `/replica invite`: Generate server invite
-  - `server` (choice, required): Target server
-  - `duration` (integer, optional): Invite duration in hours (1-168, default: 24)
+- `/replica invite`: Generate server invitation
+  - `server` (choice, required): Target server identifier
+  - `duration` (integer, optional): Invitation validity period in hours (1-168, default: 24)
 
-### Cloning Commands
+### Replication Commands
 
-- `/replica settings`: Clone server settings
-  - Copies server-wide configurations
-  - Includes verification levels and notification settings
+- `/replica settings`: Replicate server configurations
+  - Duplicates guild-wide settings
+  - Includes verification and notification parameters
 
-- `/replica icon`: Clone server icon
-  - Transfers server icon to the target server
+- `/replica icon`: Replicate server icon
+  - Transfers guild icon asset
 
-- `/replica banner`: Clone server banner
-  - Transfers server banner to the target server
+- `/replica banner`: Replicate server banner
+  - Transfers guild banner asset
 
-- `/replica roles`: Clone server roles
-  - Duplicates role hierarchy
-  - Preserves permissions and colors
-  - Maintains role icons (if available)
+- `/replica roles`: Replicate role hierarchy
+  - Replicates role structure
+  - Preserves permission bitfields and color codes
+  - Maintains role assets where applicable
 
-- `/replica categories`: Clone channel categories
-  - Creates category structure
-  - Preserves category permissions
+- `/replica categories`: Replicate channel categories
+  - Establishes category structure
+  - Maintains permission overwrites
 
-- `/replica c-channels`: Clone community channels
-  - Clones forum channels
-  - Duplicates stage channels
-  - Preserves channel settings and permissions
+- `/replica c-channels`: Replicate community channels
+  - Duplicates forum structures
+  - Replicates stage instances
+  - Preserves channel configurations and permissions
 
-- `/replica nc-channels`: Clone non-community channels
-  - Clones text channels
-  - Duplicates voice channels
-  - Copies announcement channels
-  - Maintains channel permissions and settings
+- `/replica nc-channels`: Replicate standard channels
+  - Duplicates text channels
+  - Replicates voice channels
+  - Transfers announcement channels
+  - Maintains channel-specific configurations
 
-- `/replica emojis`: Clone server emojis
-  - Transfers custom emojis
-  - Preserves emoji names and roles
+- `/replica emojis`: Replicate custom emojis
+  - Transfers emoji assets
+  - Preserves metadata and role restrictions
 
-- `/replica stickers`: Clone server stickers
-  - Copies custom stickers
-  - Maintains sticker metadata
+- `/replica stickers`: Replicate custom stickers
+  - Transfers sticker assets
+  - Maintains associated metadata
 
 ### Migration Command
 
-- `/replica migrate`: Migrate channel content
-  - `origin` (string, required): Source channel ID
-  - `server` (string, required): Destination server ID
-  - `channel` (string, required): Destination channel ID
+- `/replica migrate`: Execute channel content migration (adapted from [Discord-Utilities](https://github.com/retr0-init/DIscord-Utilities/blob/master/main.py#L583) with cross-server support)
+  - `origin` (string, required): Source channel identifier
+  - `server` (string, required): Destination server identifier
+  - `channel` (string, required): Destination channel identifier
 
 ### Configuration Command
 
-- `/replica config`: Configure bot settings
-  - `webhook` (float, optional): Set webhook delay
-  - `process` (float, optional): Set process delay
-  - `admin_user_id` (string, optional): Set admin user ID
-  - `source_guild_id` (string, optional): Set source guild ID
-  - `target_guild_id` (string, optional): Set target guild ID
+- `/replica config`: Modify runtime parameters
+  - `webhook` (float, optional): Webhook execution delay (0.1-5.0 seconds)
+  - `process` (float, optional): Process execution delay (0.1-5.0 seconds)
+  - `admin_user_id` (string, optional): Administrative user identifier
+  - `source_guild_id` (string, optional): Source guild identifier
+  - `target_guild_id` (string, optional): Target guild identifier
 
 ### Debug Command
 
-- `/replica export`: Export extension files
-  - `type` (choice, required): Type of files to export
-    - All Files
-    - Individual files from extension directory
+- `/replica export`: Export extension assets
+  - `type` (choice, required): Asset export scope
+    - Complete extension directory
+    - Specific extension components
+  - Internationalization support (English, Chinese)
 
 ## Configuration
 
