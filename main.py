@@ -13,15 +13,15 @@ from weakref import proxy
 import aiofiles
 import aiofiles.os
 import aiofiles.ospath
-import aiohttp
 import aioshutil
 import interactions
 import orjson
-from interactions.api.events import MessageCreate
 from interactions.client.errors import Forbidden, HTTPException, NotFound
 
+from .lib import *
+
 BASE_DIR: str = os.path.abspath(os.path.dirname(__file__))
-LOG_FILE: str = os.path.join(BASE_DIR, "clone.log")
+LOG_FILE: str = os.path.join(BASE_DIR, "replica.log")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -97,41 +97,47 @@ class Clone(interactions.Extension):
         self.CONFIG_FILE: str = os.path.join(BASE_DIR, "config.json")
         self.STATE_FILE: str = os.path.join(BASE_DIR, "state.json")
 
-        self.guild: interactions.Guild = None
-        self.new_guild: interactions.Guild = None
-        self.enabled_community: bool = False
-        self.delay: float = 0
-        self.disable_fetch_channels: bool = False
-        self.clone_messages_toggled: bool = False
-        self.webhook_delay: float = 0
+        self.guild: interactions.Guild | None = None
+        self.new_guild: interactions.Guild | None = None
         self.live_update: bool = False
-        self.new_messages_enabled: bool = False
 
+        self.process_delay: float = 0.2
+        self.webhook_delay: float = 0.2
+        self.webhook_semaphore = asyncio.Semaphore(5)
+        self.member_semaphore = asyncio.Semaphore(10)
+        self.channel_semaphore = asyncio.Semaphore(2)
         self.message_queue: deque[tuple] = deque(maxlen=10000)
         self.new_messages_queue: deque[tuple] = deque(maxlen=1000)
         self.processed_channels: list[int] = []
         self.mappings: dict[str, dict] = {}
+        self.last_executed_method: str = ""
 
     async def initialize_data(self) -> None:
         await self.model.load_state(self.STATE_FILE)
         try:
             await self.model.load_config(self.CONFIG_FILE)
             config = self.model.mappings
-            self.clone_messages_toggled = config.get("clone_messages", False)
-            self.webhook_delay = config.get("webhook_delay", 0.85)
-            self.delay = config.get("process_delay", 0.85)
+            self.webhook_delay = config.get("webhook_delay", 0.2)
+            self.process_delay = config.get("process_delay", 0.2)
             self.live_update = config.get("live_update", False)
-            self.disable_fetch_channels = config.get("disable_fetch_channels", False)
+
+            if saved_guild_id := config.get("new_guild_id"):
+                try:
+                    self.new_guild = await self.bot.fetch_guild(saved_guild_id)
+                    logger.info(
+                        f"Loaded saved guild: {self.new_guild.name} ({self.new_guild.id})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load saved guild {saved_guild_id}: {e}")
+                    self.new_guild = None
+
         except Exception as e:
             logger.warning(f"Error loading config file, using default settings: {e}")
-            self.clone_messages_toggled = False
-            self.webhook_delay = int(0.85 * 1000)
-            self.delay = int(0.85 * 1000)
+            self.webhook_delay = int(0.2 * 1000)
+            self.process_delay = int(0.2 * 1000)
             self.live_update = False
-            self.disable_fetch_channels = False
 
-    async def find_webhook(self, channel_id: int) -> interactions.Webhook | None:
-        return self.mappings["webhooks"].get(str(channel_id))
+    # Create
 
     @staticmethod
     async def create_channel_log(
@@ -151,27 +157,60 @@ class Clone(interactions.Extension):
             f"{'Deleted' if deleted else 'Created'} webhook in #{channel_name}"
         )
 
-    async def populate_queue(self, limit: int = 512) -> None:
-        for channel_id, new_channel in self.mappings["channels"].items():
+    async def create_new_guild(self) -> None:
+        try:
+            if not self.guild:
+                raise ValueError("Source guild is not set")
+
+            self.new_guild = await interactions.Guild.create(
+                name=f"{self.guild.name} (Dyad)",
+                client=self.bot,
+                verification_level=(
+                    self.guild.verification_level
+                    if self.guild.verification_level
+                    else interactions.VerificationLevel.NONE
+                ),
+                default_message_notifications=(
+                    self.guild.default_message_notifications
+                    if self.guild.default_message_notifications
+                    else interactions.DefaultNotificationLevel.ALL_MESSAGES
+                ),
+                explicit_content_filter=(
+                    self.guild.explicit_content_filter
+                    if self.guild.explicit_content_filter
+                    else interactions.ExplicitContentFilterLevel.DISABLED
+                ),
+            )
+
             try:
-                original_channel: interactions.GuildText = (
-                    await self.guild.fetch_channel(channel_id)
-                )
+                await self.model.load_config(self.CONFIG_FILE)
+                current_config = self.model.mappings
+            except Exception:
+                current_config = {}
 
-                if isinstance(
-                    original_channel,
-                    (interactions.GuildForum, interactions.GuildStageVoice),
-                ):
-                    continue
+            current_config["new_guild_id"] = str(self.new_guild.id)
+            self.model.mappings = current_config
 
-                async for message in original_channel.history(limit=limit):
-                    self.message_queue.append((new_channel, message))
-            except Forbidden:
-                logger.debug(
-                    f"Can't fetch channel message history (no permissions): {channel_id}"
+            try:
+                await self.model.save_config(self.CONFIG_FILE)
+                logger.info(
+                    f"Created new guild: {self.new_guild.name} ({self.new_guild.id}) and saved ID to config"
                 )
+            except Exception as e:
+                logger.error(f"Failed to save new guild ID to config: {e}")
+
+            await asyncio.sleep(self.process_delay)
+        except Exception as e:
+            logger.error(f"Failed to create new guild: {e}")
+            raise
+
+    # Serve
 
     async def prepare_server(self) -> None:
+        if not self.new_guild:
+            logger.error("New guild is not initialized")
+            return
+
         cleanup_methods = {
             "roles": lambda: self.bot.http.get_roles(self.new_guild.id),
             "channels": self.new_guild.fetch_channels,
@@ -179,17 +218,107 @@ class Clone(interactions.Extension):
             "stickers": lambda: self.bot.http.list_guild_stickers(self.new_guild.id),
         }
 
-        if "COMMUNITY" in self.guild.features:
-            self.enabled_community = True
-            logger.warning(
-                "Community mode is toggled. Will be set up after channel processing (if enabled)."
-            )
-
         for method_name, method in cleanup_methods.items():
             logger.debug(f"Processing cleaning method: {method_name}...")
             await self.cleanup_items(await method())
 
         self.last_executed_method = "prepare_server"
+
+    async def clone_settings(self) -> bool:
+        if not self.guild or not self.new_guild:
+            return False
+
+        channels = {
+            "afk": (
+                self.get_channel_from_mapping(self.guild.afk_channel_id)
+                if hasattr(self.guild, "afk_channel_id")
+                else None
+            ),
+            "system": (
+                self.get_channel_from_mapping(self.guild.system_channel)
+                if hasattr(self.guild, "system_channel")
+                else None
+            ),
+            "public_updates": (
+                self.get_channel_from_mapping(self.guild.public_updates_channel)
+                if hasattr(self.guild, "public_updates_channel")
+                else None
+            ),
+            "rules": (
+                self.get_channel_from_mapping(self.guild.rules_channel)
+                if hasattr(self.guild, "rules_channel")
+                else None
+            ),
+            "safety_alerts": (
+                self.get_channel_from_mapping(self.guild.safety_alerts_channel)
+                if hasattr(self.guild, "safety_alerts_channel")
+                else None
+            ),
+        }
+
+        if not channels["public_updates"]:
+            logger.error(
+                "Can't create community: missing access to public updates channel"
+            )
+            return False
+
+        try:
+            await self.new_guild.edit(
+                features=["COMMUNITY"],
+                name=self.guild.name if hasattr(self.guild, "name") else None,
+                description=(
+                    self.guild.description
+                    if hasattr(self.guild, "description")
+                    else None
+                ),
+                verification_level=(
+                    self.guild.verification_level
+                    if hasattr(self.guild, "verification_level")
+                    else None
+                ),
+                default_message_notifications=(
+                    self.guild.default_message_notifications
+                    if hasattr(self.guild, "default_message_notifications")
+                    else None
+                ),
+                explicit_content_filter=(
+                    self.guild.explicit_content_filter
+                    if hasattr(self.guild, "explicit_content_filter")
+                    else None
+                ),
+                afk_channel=channels["afk"],
+                afk_timeout=(
+                    self.guild.afk_timeout
+                    if hasattr(self.guild, "afk_timeout")
+                    else None
+                ),
+                system_channel=channels["system"],
+                system_channel_flags=(
+                    self.guild.system_channel_flags
+                    if hasattr(self.guild, "system_channel_flags")
+                    else None
+                ),
+                rules_channel=channels["rules"],
+                public_updates_channel=channels["public_updates"],
+                safety_alerts_channel=channels["safety_alerts"],
+                preferred_locale=(
+                    self.guild.preferred_locale
+                    if hasattr(self.guild, "preferred_locale")
+                    else None
+                ),
+                premium_progress_bar_enabled=(
+                    self.guild.premium_progress_bar_enabled
+                    if hasattr(self.guild, "premium_progress_bar_enabled")
+                    else False
+                ),
+            )
+            logger.debug("Updated guild community settings")
+            await asyncio.sleep(self.process_delay)
+            self.last_executed_method = "clone_settings"
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update community settings: {e}")
+            return False
 
     async def cleanup_items(self, items) -> None:
         for item in items:
@@ -197,20 +326,29 @@ class Clone(interactions.Extension):
                 await item.delete()
             except HTTPException:
                 continue
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(self.process_delay)
 
-        await self.new_guild.edit(icon=None, banner=None, description=None)
+        if self.new_guild is not None:
+            await self.new_guild.edit(icon=None, banner=None, description=None)
 
     async def clone_icon(self) -> None:
-        if self.guild.icon:
+        if (
+            self.guild is not None
+            and self.guild.icon is not None
+            and self.new_guild is not None
+        ):
             await self.new_guild.edit(icon=BytesIO(await self.guild.icon.fetch()))
-        await asyncio.sleep(self.delay)
+        await asyncio.sleep(self.process_delay)
         self.last_executed_method = "clone_icon"
 
     async def clone_banner(self) -> None:
-        if self.guild.banner:
-            await self.new_guild.edit(banner=BytesIO(await self.guild.banner.fetch()))
-            await asyncio.sleep(self.delay)
+        if (
+            self.guild is not None
+            and self.guild.banner is not None
+            and self.new_guild is not None
+        ):
+            await self.new_guild.edit(banner=BytesIO(await self.guild.splash.fetch()))
+            await asyncio.sleep(self.process_delay)
         self.last_executed_method = "clone_banner"
 
     async def clone_roles(self):
@@ -231,8 +369,10 @@ class Clone(interactions.Extension):
                     hoist=role.hoist,
                     mentionable=role.mentionable,
                     permissions=role.permissions,
+                    icon=role.icon,
+                    unicode_emoji=role.unicode_emoji,
                 )
-                await asyncio.sleep(self.delay)
+                await asyncio.sleep(self.process_delay)
                 continue
 
             self.mappings["roles"][role.id] = new_role = (
@@ -242,15 +382,25 @@ class Clone(interactions.Extension):
                     hoist=role.hoist,
                     mentionable=role.mentionable,
                     permissions=role.permissions,
+                    icon=role.icon,
                 )
             )
+
+            if role.unicode_emoji:
+                await new_role.edit(unicode_emoji=role.unicode_emoji)
+                await asyncio.sleep(self.process_delay)
+
             await self.create_object_log(
                 object_type="role", object_name=new_role.name, object_id=new_role.id
             )
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(self.process_delay)
         self.last_executed_method = "clone_roles"
 
     async def clone_categories(self, perms: bool = True) -> None:
+        if not self.new_guild:
+            logger.warning("New guild is not set")
+            return
+
         categories = [
             channel
             for channel in self.mappings["fetched_data"]["channels"]
@@ -280,42 +430,67 @@ class Clone(interactions.Extension):
                 object_name=new_category.name,
                 object_id=new_category.id,
             )
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(self.process_delay)
         self.last_executed_method = "clone_categories"
 
     async def clone_channels(self, perms: bool = True) -> None:
-        for channel in self.mappings["fetched_data"]["channels"]:
-            if not self.disable_fetch_channels:
-                try:
+        if not self.new_guild:
+            logger.warning("New guild is not set")
+            return
+
+        channels = [
+            c
+            for c in self.mappings["fetched_data"]["channels"]
+            if isinstance(
+                c,
+                (
+                    interactions.GuildText,
+                    interactions.GuildVoice,
+                    interactions.GuildForum,
+                    interactions.GuildStageVoice,
+                    interactions.GuildNews,
+                ),
+            )
+        ]
+
+        for channel in channels:
+            try:
+                if self.guild:
                     channel = await self.guild.fetch_channel(channel.id)
-                except Forbidden:
-                    logger.debug(f"Can't fetch channel {channel.name} | {channel.id}")
+                else:
+                    logger.warning("Guild is not set")
                     continue
+            except Forbidden:
+                logger.debug(f"Can't fetch channel {channel.name} | {channel.id}")
+                continue
 
-            category = self.mappings["categories"].get(channel.category_id)
+            category = self.mappings["categories"].get(channel.parent_id)
             overwrites = {}
-            for overwrite in channel.permission_overwrites:
-                if perms and isinstance(overwrite.id, interactions.Role):
-                    perm = interactions.PermissionOverwrite.for_target(overwrite.id)
-                    if overwrite.allow:
-                        perm.add_allows(overwrite.allow)
-                    if overwrite.deny:
-                        perm.add_denies(overwrite.deny)
-                    overwrites[self.mappings["roles"][overwrite.id]] = perm
 
-            if overwrites:
-                logger.debug(f"Got overwrites mapping for channel #{channel.name}")
+            if perms and channel.permission_overwrites:
+                for overwrite in channel.permission_overwrites:
+                    if isinstance(overwrite.id, interactions.Role):
+                        perm = interactions.PermissionOverwrite.for_target(overwrite.id)
+                        if overwrite.allow:
+                            perm.add_allows(overwrite.allow)
+                        if overwrite.deny:
+                            perm.add_denies(overwrite.deny)
+                        overwrites[self.mappings["roles"][overwrite.id]] = perm
+
+            channel_args = {
+                "name": channel.name,
+                "position": channel.position,
+                "category": category,
+                "permission_overwrites": overwrites,
+            }
 
             if isinstance(channel, interactions.GuildText):
                 self.mappings["channels"][channel.id] = new_channel = (
                     await self.new_guild.create_text_channel(
-                        name=channel.name,
-                        position=channel.position,
+                        **channel_args,
                         topic=channel.topic,
                         rate_limit_per_user=channel.rate_limit_per_user,
                         nsfw=channel.nsfw,
-                        category=category,
-                        permission_overwrites=overwrites,
                     )
                 )
                 await self.create_channel_log(
@@ -323,15 +498,19 @@ class Clone(interactions.Extension):
                     channel_name=new_channel.name,
                     channel_id=new_channel.id,
                 )
+
             elif isinstance(channel, interactions.GuildVoice):
+                bitrate = (
+                    min(channel.bitrate, self.new_guild.bitrate_limit)
+                    if self.new_guild.bitrate_limit
+                    else channel.bitrate
+                )
+
                 self.mappings["channels"][channel.id] = new_channel = (
                     await self.new_guild.create_voice_channel(
-                        name=channel.name,
-                        position=channel.position,
-                        bitrate=min(channel.bitrate, self.new_guild.bitrate_limit),
+                        **channel_args,
+                        bitrate=bitrate,
                         user_limit=channel.user_limit,
-                        category=category,
-                        permission_overwrites=overwrites,
                     )
                 )
                 await self.create_channel_log(
@@ -339,133 +518,74 @@ class Clone(interactions.Extension):
                     channel_name=new_channel.name,
                     channel_id=new_channel.id,
                 )
-            await asyncio.sleep(self.delay)
 
-        if self.enabled_community:
-            logger.info("Processing community settings")
-            if await self.process_community():
-                logger.info("Processing community channels")
-                await self.add_community_channels(perms=perms)
+            elif isinstance(channel, interactions.GuildForum):
+                tags = channel.available_tags
+                for tag in tags:
+                    if tag.emoji and tag.emoji.id:
+                        tag.emoji = self.mappings["emojis"].get(tag.emoji.id)
+
+                self.mappings["channels"][channel.id] = new_channel = (
+                    await self.new_guild.create_forum_channel(
+                        **channel_args,
+                        topic=channel.topic,
+                        nsfw=channel.nsfw,
+                        layout=channel.default_forum_layout,
+                        rate_limit_per_user=channel.rate_limit_per_user,
+                        sort_order=channel.default_sort_order,
+                        available_tags=tags,
+                    )
+                )
+                await self.create_channel_log(
+                    channel_type="forum",
+                    channel_name=new_channel.name,
+                    channel_id=new_channel.id,
+                )
+
+            elif isinstance(channel, interactions.GuildStageVoice):
+                self.mappings["channels"][channel.id] = new_channel = (
+                    await self.new_guild.create_stage_channel(
+                        **channel_args,
+                        bitrate=min(channel.bitrate, self.new_guild.bitrate_limit),
+                        user_limit=channel.user_limit,
+                    )
+                )
+                await self.create_channel_log(
+                    channel_type="stage",
+                    channel_name=new_channel.name,
+                    channel_id=new_channel.id,
+                )
+
+            elif isinstance(channel, interactions.GuildNews):
+                self.mappings["channels"][channel.id] = new_channel = (
+                    await self.new_guild.create_news_channel(
+                        **channel_args,
+                        topic=channel.topic,
+                        nsfw=channel.nsfw,
+                    )
+                )
+                await self.create_channel_log(
+                    channel_type="news",
+                    channel_name=new_channel.name,
+                    channel_id=new_channel.id,
+                )
+
+            await asyncio.sleep(self.process_delay)
 
         self.last_executed_method = "clone_channels"
 
-    async def process_community(self) -> bool:
-        if not self.enabled_community:
-            return False
-
-        channels = {
-            "afk": self.get_channel_from_mapping(self.guild.afk_channel_id),
-            "system": self.get_channel_from_mapping(self.guild.system_channel),
-            "public_updates": self.get_channel_from_mapping(
-                self.guild.public_updates_channel
-            ),
-            "rules": self.get_channel_from_mapping(self.guild.rules_channel),
-        }
-
-        if not channels["public_updates"]:
-            logger.error(
-                "Can't create community: missing access to public updates channel"
-            )
-            return False
-
-        await self.new_guild.edit(
-            features=["COMMUNITY"],
-            verification_level=self.guild.verification_level,
-            default_message_notifications=self.guild.default_message_notifications,
-            afk_channel=channels["afk"],
-            afk_timeout=self.guild.afk_timeout,
-            system_channel=channels["system"],
-            system_channel_flags=self.guild.system_channel_flags,
-            rules_channel=channels["rules"],
-            public_updates_channel=channels["public_updates"],
-            explicit_content_filter=self.guild.explicit_content_filter,
-            preferred_locale=self.guild.preferred_locale,
-            premium_progress_bar_enabled=self.guild.premium_progress_bar_enabled,
-        )
-        logger.debug("Updated guild community settings")
-        await asyncio.sleep(self.delay)
-        return True
-
-    async def add_community_channels(self, perms: bool = True) -> None:
-        if not self.enabled_community:
+    async def clone_emojis(self) -> None:
+        if not self.new_guild:
             return
 
-        channels = [
-            c
-            for c in self.mappings["fetched_data"]["channels"]
-            if isinstance(c, (interactions.GuildForum, interactions.GuildStageVoice))
-        ]
-
-        for channel in channels:
-            category = (
-                self.mappings["categories"].get(channel.parent_id)
-                if channel.parent_id
-                else None
-            )
-            overwrites = {}
-
-            if perms and channel.permission_overwrites:
-                overwrites = {
-                    self.mappings["roles"][o.id]: (
-                        (perm := interactions.PermissionOverwrite.for_target(o.id))
-                        and [
-                            perm.add_allows(o.allow) if o.allow else None,
-                            perm.add_denies(o.deny) if o.deny else None,
-                        ]
-                        and perm
-                    )
-                    for o in channel.permission_overwrites
-                    if isinstance(o.id, interactions.Role)
-                }
-
-            if isinstance(channel, interactions.GuildForum):
-                tags = channel.available_tags
-                for tag in tags:
-                    if tag.emoji.id:
-                        tag.emoji = self.mappings["emojis"].get(tag.emoji.id)
-
-                new_channel = await self.new_guild.create_forum_channel(
-                    name=channel.name,
-                    topic=channel.topic,
-                    position=channel.position,
-                    category=category,
-                    nsfw=channel.nsfw,
-                    permission_overwrites=overwrites,
-                    layout=channel.default_forum_layout,
-                    rate_limit_per_user=channel.rate_limit_per_user,
-                    sort_order=channel.default_sort_order,
-                    available_tags=tags,
-                )
-                self.mappings["channels"][channel.id] = new_channel
-                await self.create_channel_log("forum", new_channel.name, new_channel.id)
-
-            elif isinstance(channel, interactions.GuildStageVoice):
-                new_channel = await self.new_guild.create_stage_channel(
-                    name=channel.name,
-                    category=category,
-                    position=channel.position,
-                    bitrate=min(channel.bitrate, self.new_guild.bitrate_limit),
-                    user_limit=channel.user_limit,
-                    permission_overwrites=overwrites,
-                )
-                self.mappings["channels"][channel.id] = new_channel
-                await self.create_channel_log("stage", new_channel.name, new_channel.id)
-
-            await asyncio.sleep(self.delay)
-
-        self.last_executed_method = "add_community_channels"
-
-    async def clone_emojis(self) -> None:
         emoji_limit = min(
             self.new_guild.emoji_limit - 5,
-            (
-                current_emojis := await self.new_guild.fetch_all_custom_emojis()
-            ).__len__(),
+            len(await self.new_guild.fetch_all_custom_emojis()),
         )
         emoji_data = [
             (emoji.name, emoji.roles, await emoji.read())
             for emoji in self.mappings["fetched_data"]["emojis"][:emoji_limit]
-            if len(current_emojis) < emoji_limit
+            if len(await self.new_guild.fetch_all_custom_emojis()) < emoji_limit
         ]
 
         for name, roles, imagefile in emoji_data:
@@ -481,11 +601,14 @@ class Clone(interactions.Extension):
             await self.create_object_log(
                 object_type="emoji", object_name=new_emoji.name, object_id=new_emoji.id
             )
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(self.process_delay)
 
         self.last_executed_method = "clone_emojis"
 
     async def clone_stickers(self) -> None:
+        if not self.new_guild:
+            return
+
         sticker_limit, created = self.new_guild.sticker_limit, 0
         sticker_data = [
             (s.name, s.description, await s.to_file(), s.tags, s.id, s.url)
@@ -511,202 +634,14 @@ class Clone(interactions.Extension):
                     f"Can't create sticker with id {sticker_id}, url: {sticker_url}"
                 )
 
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(self.process_delay)
 
         self.last_executed_method = "clone_stickers"
-
-    async def send_webhook(
-        self,
-        webhook: interactions.Webhook,
-        message: interactions.Message,
-        delay: float = 0.85,
-    ) -> None:
-        author: interactions.User = message.author
-        files = []
-
-        if message.attachments:
-            async with aiohttp.ClientSession() as session:
-                files.extend(
-                    [
-                        interactions.File(
-                            file=BytesIO(await (await session.get(a.url)).read()),
-                            file_name=a.filename,
-                        )
-                        for a in message.attachments
-                        if a.url and (await session.get(a.url)).status == 200
-                    ]
-                )
-
-        name = (
-            f"{author.display_name} at {message.created_at.strftime('%d/%m/%Y %H:%M')}"
-        )
-        content = message.content
-
-        replacements = {
-            **{
-                f"<#{old_id}>": f"<#{new.id}>"
-                for old_id, new in self.mappings.get("channels", {}).items()
-            },
-            **{
-                f"<@&{old_id}>": f"<@&{new.id}>"
-                for old_id, new in self.mappings.get("roles", {}).items()
-            },
-            **{
-                f"https://discord.com/channels/{self.guild.id}/{old_id}": f"https://discord.com/channels/{self.new_guild.id}/{new.id}"
-                for old_id, new in self.mappings.get("channels", {}).items()
-            },
-        }
-
-        for old, new in replacements.items():
-            content = content.replace(old, new)
-
-        try:
-            await webhook.send(
-                content=content,
-                avatar_url=author.display_avatar.url,
-                username=name,
-                embeds=message.embeds,
-                files=files,
-            )
-
-            if message.content:
-                truncated = self.truncate_string(
-                    string=message.content, length=32, replace_newline_with=""
-                ).rstrip()
-
-                logger.debug(
-                    f"Cloned message from {author.display_name}"
-                    + (f": {truncated}" if truncated else "")
-                )
-
-        except (HTTPException, Forbidden):
-            logger.debug(
-                f"Can't send, skipping message in #{message.channel.name if message.channel else ''}"
-            )
-
-        await asyncio.sleep(delay)
-
-    async def clone_messages(
-        self,
-        messages_limit: int = 100,
-        clear_webhooks: bool = False,
-    ) -> None:
-        if not self.clone_messages_toggled:
-            return
-
-        self.processing_messages = True
-        await self.populate_queue(messages_limit)
-
-        queue_len = len(self.message_queue)
-        logger.debug(f"Collected {queue_len} messages")
-
-        total_latency = queue_len * (self.webhook_delay + self.bot.latency)
-        logger.info(
-            f"Calculated message cloning ETA: {self.format_time(timedelta(seconds=total_latency))}"
-        )
-
-        await self.clone_messages_from_queue(clear_webhooks=clear_webhooks)
-        self.last_executed_method = "clone_messages"
-
-    async def cleanup_after_cloning(self, clear: bool = False) -> None:
-        self.message_queue.clear()
-
-        if clear:
-            webhooks = self.mappings["webhooks"]
-            for webhook in webhooks.values():
-                await webhook.delete()
-                await asyncio.sleep(self.webhook_delay)
-            webhooks.clear()
-
-        self.processing_messages = False
-        self.last_executed_method = "cleanup_after_cloning"
-
-    async def clone_messages_from_queue(self, clear_webhooks: bool = True) -> None:
-        try:
-            if not self.message_queue:
-                logger.warning("Message queue is empty")
-                return
-
-            if channel_msgs := self.split_messages_by_channel(self.message_queue):
-                await self.process_messages_channel_map(channel_msgs)
-
-            if self.new_messages_queue:
-                await asyncio.sleep(self.webhook_delay)
-                if new_msgs := self.split_messages_by_channel(self.new_messages_queue):
-                    await self.process_messages_channel_map(new_msgs)
-        except Exception as e:
-            logger.error(f"Error processing message queue: {e}")
-        finally:
-            await self.cleanup_after_cloning(clear=clear_webhooks)
 
     def get_channel_from_mapping(self, channel) -> interactions.GuildText | None:
         return self.mappings["channels"].get(channel.id) if channel else None
 
-    async def process_messages_channel_map(self, channel_messages_map: Dict) -> None:
-        while channel_messages_map:
-            for channel, messages in list(channel_messages_map.items()):
-                if messages:
-                    await self.clone_message_with_delay(channel, messages.pop(0))
-                    await asyncio.sleep(self.webhook_delay)
-                else:
-                    self.processed_channels.append(channel.id)
-                    del channel_messages_map[channel]
-
-    async def clone_message_with_delay(
-        self, channel: interactions.GuildText, message: interactions.Message
-    ) -> None:
-        webhook = self.find_webhook(channel.id)
-        if not webhook:
-            try:
-                webhook = await channel.create_webhook(name="bot by itskekoff")
-                await asyncio.sleep(self.webhook_delay)
-                await self.create_webhook_log(channel_name=channel.name)
-                self.mappings["webhooks"][channel.id] = webhook
-            except (NotFound, Forbidden) as e:
-                logger.debug(
-                    f"Can't create webhook: {'unknown channel' if isinstance(e, NotFound) else 'missing permissions'}"
-                )
-                return
-
-        try:
-            await self.send_webhook(webhook, message)
-        except Forbidden:
-            channel_name = getattr(message.channel, "name", "unknown")
-            logger.debug(f"Missing access for channel: #{channel_name}")
-
-    @interactions.listen(MessageCreate)
-    async def on_message_create(self, event: MessageCreate) -> None:
-        message = event.message
-        guild = message.guild
-        if not (guild and guild.id == self.guild.id):
-            return
-
-        try:
-            if not self.live_update:
-                return
-
-            channel_id = message.channel.id
-            new_channel = self.mappings["channels"].get(channel_id)
-
-            if new_channel is None:
-                logger.warning(
-                    "Can't clone message from channel that doesn't exists in new guild"
-                )
-                return
-
-            if (
-                self.processing_messages
-                and new_channel.id not in self.processed_channels
-            ):
-                if self.new_messages_enabled:
-                    self.new_messages_queue.append((new_channel, message))
-                return
-
-            await self.clone_message_with_delay(new_channel, message)
-            await asyncio.sleep(self.webhook_delay)
-
-        except KeyError:
-            return
+    # Commands
 
     module_base: interactions.SlashCommand = interactions.SlashCommand(
         name=interactions.LocalisedName(
@@ -757,24 +692,28 @@ class Clone(interactions.Extension):
                 if condition and last_method != func.__name__:
                     conditions_to_functions[True].append((msg, func))
 
+            conditions_to_functions[True].append(
+                ("Creating new guild...", self.create_new_guild)
+            )
+
             function_map = (
-                ("clear_guild", (self.prepare_server, "Preparing guild to process...")),
-                ("clone_icon", (self.clone_icon, "Processing server icon...")),
-                ("clone_banner", (self.clone_banner, "Processing server banner...")),
-                ("clone_roles", (self.clone_roles, "Processing server roles...")),
+                (
+                    "prepare_server",
+                    (self.prepare_server, "Preparing guild to process..."),
+                ),
+                ("clone_settings", (self.clone_settings, "Processing settings...")),
+                ("clone_icon", (self.clone_icon, "Processing icon...")),
+                ("clone_banner", (self.clone_banner, "Processing banner...")),
+                ("clone_roles", (self.clone_roles, "Processing roles...")),
                 (
                     "clone_channels",
                     [
-                        (self.clone_categories, "Processing server categories..."),
-                        (self.clone_channels, "Processing server channels..."),
+                        (self.clone_categories, "Processing categories..."),
+                        (self.clone_channels, "Processing channels..."),
                     ],
                 ),
-                ("clone_emojis", (self.clone_emojis, "Processing server emojis...")),
+                ("clone_emojis", (self.clone_emojis, "Processing emojis...")),
                 ("clone_stickers", (self.clone_stickers, "Processing stickers...")),
-                (
-                    "clone_messages",
-                    (self.clone_messages, "Processing server messages..."),
-                ),
             )
 
             for key, value in function_map:
@@ -795,41 +734,125 @@ class Clone(interactions.Extension):
         await ctx.send("Process completed.", ephemeral=True)
 
     @module_base.subcommand(
+        sub_cmd_name="migrate", sub_cmd_description="Migrate channel across servers"
+    )
+    @interactions.slash_option(
+        "origin",
+        "The origin channel to migrate from",
+        interactions.OptionType.CHANNEL,
+        required=True,
+    )
+    @interactions.slash_option(
+        "server",
+        "The destination server ID to migrate to",
+        interactions.OptionType.STRING,
+        required=True,
+        argument_name="destination_server",
+    )
+    @interactions.slash_option(
+        "channel",
+        "The destination channel ID to migrate to",
+        interactions.OptionType.STRING,
+        required=True,
+        argument_name="destination_channel",
+    )
+    @interactions.slash_default_member_permission(
+        interactions.Permissions.ADMINISTRATOR
+    )
+    async def migrate(
+        self,
+        ctx: interactions.SlashContext,
+        origin: interactions.GuildChannel,
+        destination_server: str,
+        destination_channel: str,
+    ) -> None:
+        try:
+            destination_guild = await self.bot.fetch_guild(destination_server)
+            if not destination_guild:
+                await ctx.send("Could not find the destination server.", ephemeral=True)
+                return
+
+            destination = await destination_guild.fetch_channel(destination_channel)
+            if not destination:
+                await ctx.send(
+                    "Could not find the destination channel.", ephemeral=True
+                )
+                return
+
+            valid_pairs = {
+                (interactions.GuildText, interactions.GuildText),
+                (interactions.GuildForum, interactions.GuildForum),
+                (interactions.GuildForumPost, interactions.GuildForum),
+                (interactions.GuildPublicThread, interactions.GuildText),
+            }
+
+            origin_type = type(origin)
+            dest_type = type(destination)
+
+            if (origin_type, dest_type) not in valid_pairs:
+                await ctx.send(
+                    "\n".join(
+                        [
+                            "Only the following migrations are supported:",
+                            "- Text Channel -> Text Channel",
+                            "- Forum -> Forum",
+                            "- Public Thread in Text Channel -> Text Channel",
+                            "- Forum Post -> Forum",
+                        ]
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await ctx.send(
+                f"Migrating {origin.mention} to {destination.mention} in server {destination_guild.name}...",
+                ephemeral=True,
+            )
+
+            if origin_type in {interactions.GuildText, interactions.GuildForum}:
+                await migrate_channel(
+                    origin,
+                    destination,
+                    self.mappings,
+                    ctx.guild.id,
+                    destination_guild.id,
+                    ctx.bot,
+                )
+            else:
+                await migrate_thread(
+                    origin,
+                    destination,
+                    self.mappings,
+                    ctx.guild.id,
+                    destination_guild.id,
+                    ctx.bot,
+                )
+
+            await ctx.channel.send("Migration completed!")
+
+        except NotFound:
+            await ctx.send(
+                "Could not find the specified server or channel.", ephemeral=True
+            )
+        except Forbidden:
+            await ctx.send(
+                "Bot does not have permission to access the destination server/channel.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Migration error: {e}")
+            await ctx.send(
+                "Something went wrong. Please contact the admin!", ephemeral=True
+            )
+
+    @module_base.subcommand(
         sub_cmd_name="config", sub_cmd_description="Configure clone settings"
     )
     @interactions.slash_option(
-        name="clone_messages",
-        description="Enable/disable message cloning",
-        opt_type=interactions.OptionType.BOOLEAN,
-        required=False,
-    )
-    @interactions.slash_option(
-        name="webhook_delay",
-        description="Set delay between webhook messages (in seconds)",
-        opt_type=interactions.OptionType.NUMBER,
-        required=False,
-        min_value=0.1,
-        max_value=5.0,
-    )
-    @interactions.slash_option(
-        name="process_delay",
-        description="Set delay between clone operations (in seconds)",
-        opt_type=interactions.OptionType.NUMBER,
-        required=False,
-        min_value=0.1,
-        max_value=5.0,
-    )
-    @interactions.slash_option(
-        name="live_update",
+        name="live",
         description="Enable/disable live message updates",
         opt_type=interactions.OptionType.BOOLEAN,
-        required=False,
-    )
-    @interactions.slash_option(
-        name="disable_fetch_channels",
-        description="Disable channel fetching (faster but less accurate)",
-        opt_type=interactions.OptionType.BOOLEAN,
-        required=False,
+        argument_name="live_update",
     )
     @interactions.slash_default_member_permission(
         interactions.Permissions.ADMINISTRATOR
@@ -837,11 +860,7 @@ class Clone(interactions.Extension):
     async def config(
         self,
         ctx: interactions.SlashContext,
-        clone_messages: Optional[bool] = None,
-        webhook_delay: Optional[float] = None,
-        process_delay: Optional[float] = None,
         live_update: Optional[bool] = None,
-        disable_fetch_channels: Optional[bool] = None,
     ) -> None:
         await ctx.defer(ephemeral=True)
 
@@ -852,40 +871,26 @@ class Clone(interactions.Extension):
             logger.error(f"Error loading config: {e}")
             current_config = {}
 
-        if clone_messages is not None:
-            current_config["clone_messages"] = clone_messages
-            self.clone_messages_toggled = clone_messages
-
-        if webhook_delay is not None:
-            current_config["webhook_delay"] = webhook_delay
-            self.webhook_delay = webhook_delay
-
-        if process_delay is not None:
-            current_config["process_delay"] = process_delay
-            self.delay = process_delay
-
         if live_update is not None:
             current_config["live_update"] = live_update
             self.live_update = live_update
-
-        if disable_fetch_channels is not None:
-            current_config["disable_fetch_channels"] = disable_fetch_channels
-            self.disable_fetch_channels = disable_fetch_channels
 
         self.model.mappings = current_config
         try:
             await self.model.save_config(self.CONFIG_FILE)
 
             settings = [
-                f"Clone Messages: {current_config.get('clone_messages', False)}",
-                f"Webhook Delay: {current_config.get('webhook_delay', 0.85)}s",
-                f"Process Delay: {current_config.get('process_delay', 0.85)}s",
                 f"Live Update: {current_config.get('live_update', False)}",
-                f"Disable Channel Fetching: {current_config.get('disable_fetch_channels', False)}",
+                f"Webhook Delay: {current_config.get('webhook_delay', 0.2)}",
+                f"Process Delay: {current_config.get('process_delay', 0.2)}",
+                f"New Messages: {current_config.get('new_messages_enabled', False)}",
+                f"Fetch Channels: {current_config.get('fetch_channels', True)}",
+                f"Old Guild: {current_config.get('guild', None)}",
+                f"New Guild: {current_config.get('new_guild', None)}",
             ]
 
             await ctx.send(
-                "Configuration updated successfully!\n\n**Current Settings:**\n"
+                "Configuration updated successfully.\n\n**Current Settings:**\n"
                 + "\n".join(settings),
                 ephemeral=True,
             )
@@ -1091,3 +1096,18 @@ class Clone(interactions.Extension):
             ("second", delta.seconds % 60),
         )
         return " ".join(f"{v} {n}{'s' if v != 1 else ''}" for n, v in time_parts if v)
+
+    @staticmethod
+    async def retry_with_backoff(coro, max_retries=3, base_delay=1):
+        for attempt in range(max_retries):
+            try:
+                return await coro
+            except HTTPException as e:
+                if e.status == 429:
+                    retry_after = float(
+                        e.response.headers.get("Retry-After", base_delay)
+                    )
+                    await asyncio.sleep(retry_after * (2**attempt))
+                    continue
+                raise
+        return await coro
