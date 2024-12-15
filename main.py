@@ -1618,7 +1618,7 @@ class Replica(interactions.Extension):
         try:
             target_guild = await self.bot.fetch_guild(server)
 
-            await target_guild.delete()
+            # await target_guild.delete()
 
             await ctx.send(
                 f"Successfully deleted server: {target_guild.name}", ephemeral=True
