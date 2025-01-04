@@ -160,18 +160,8 @@ class Replica(interactions.Extension):
     # Base Command
 
     module_base: interactions.SlashCommand = interactions.SlashCommand(
-        name=interactions.LocalisedName(
-            default_locale="english_us",
-            english_us="replica",
-            chinese_china="複製",
-            chinese_taiwan="複製",
-        ),
-        description=interactions.LocalisedDesc(
-            default_locale="english_us",
-            english_us="Clone server",
-            chinese_china="複製伺服器",
-            chinese_taiwan="複製伺服器",
-        ),
+        name="replica",
+        description="Clone server",
         default_member_permissions=interactions.Permissions.ADMINISTRATOR,
     )
 
@@ -181,6 +171,7 @@ class Replica(interactions.Extension):
         sub_cmd_name="initialize",
         sub_cmd_description="Initialize bot configuration and data",
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def initialize_data(self, ctx: interactions.SlashContext) -> None:
         try:
             await self.model.load_state(self.STATE_FILE)
@@ -218,6 +209,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="create", sub_cmd_description="Create a new server for cloning"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def create_guild_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -225,8 +217,24 @@ class Replica(interactions.Extension):
                 await ctx.send("Source guild is not set.", ephemeral=True)
                 return
 
-            await self.create_new_guild()
+            templates = await self.source_guild.fetch_guild_templates()
+            if not templates:
+                await ctx.send("No templates found in source guild.", ephemeral=True)
+                return
+
+            template = templates[0]
+            guild_name = f"{self.source_guild.name} (Dyad)"
+
+            self.target_guild = await self.bot.create_guild_from_template(
+                template, guild_name
+            )
+
+            if not self.target_guild:
+                await ctx.send("Failed to create guild from template.", ephemeral=True)
+                return
+
             await ctx.send("Successfully created new server!", ephemeral=True)
+
         except Exception as e:
             logger.error(f"Error creating new guild: {e}", exc_info=True)
             await ctx.send(
@@ -316,6 +324,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="settings", sub_cmd_description="Clone server settings"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_settings_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -450,6 +459,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="icon", sub_cmd_description="Clone server icon"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_icon_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -475,6 +485,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="banner", sub_cmd_description="Clone server banner"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_banner_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -500,6 +511,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="roles", sub_cmd_description="Clone server roles"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_roles_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -624,6 +636,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="categories", sub_cmd_description="Clone channel categories"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_categories_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -685,6 +698,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="c-channels", sub_cmd_description="Clone community channels"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_comm_channels_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -771,7 +785,7 @@ class Replica(interactions.Extension):
                         target_emoji = next(
                             (
                                 emoji
-                                for emoji in self.target_guild.emojis
+                                for emoji in await self.target_guild.fetch_all_custom_emojis()
                                 if emoji.name == emoji_name
                             ),
                             None,
@@ -826,6 +840,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="nc-channels", sub_cmd_description="Clone non-community channels"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_non_comm_channels_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -871,27 +886,35 @@ class Replica(interactions.Extension):
                 logger.debug(f"Can't fetch channel {channel.name} | {channel.id}")
                 continue
 
-            # 通过名称查找父分类
             category = None
             position = 0
             if channel.parent_id:
-                parent_name = channel.parent.name if channel.parent else None
-                category = next(
-                    (
-                        cat
-                        for cat in self.target_guild.channels
-                        if isinstance(cat, interactions.GuildCategory)
-                        and cat.name == parent_name
-                    ),
-                    None,
-                )
-                if category:
-                    category_channels = [
-                        c
-                        for c in self.target_guild.channels
-                        if c.parent_id == category.id
-                    ]
-                    position = len(category_channels)
+                try:
+                    parent_channel = await self.source_guild.fetch_channel(
+                        channel.parent_id
+                    )
+                    parent_name = parent_channel.name if parent_channel else None
+                    category = next(
+                        (
+                            cat
+                            for cat in self.target_guild.channels
+                            if isinstance(cat, interactions.GuildCategory)
+                            and cat.name == parent_name
+                        ),
+                        None,
+                    )
+                    if category:
+                        category_channels = [
+                            c
+                            for c in self.target_guild.channels
+                            if c.parent_id == category.id
+                        ]
+                        position = len(category_channels)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not fetch parent category for channel {channel.name}: {e}"
+                    )
+                    continue
 
             overwrites = {}
             if perms and channel.permission_overwrites:
@@ -987,6 +1010,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="emojis", sub_cmd_description="Clone server emojis"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_emojis_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -1048,6 +1072,7 @@ class Replica(interactions.Extension):
     @module_base.subcommand(
         sub_cmd_name="stickers", sub_cmd_description="Clone server stickers"
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def clone_stickers_cmd(self, ctx: interactions.SlashContext):
         await ctx.defer(ephemeral=True)
         try:
@@ -1121,6 +1146,7 @@ class Replica(interactions.Extension):
         required=True,
         argument_name="destination_channel",
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def migrate(
         self,
         ctx: interactions.SlashContext,
@@ -1239,6 +1265,7 @@ class Replica(interactions.Extension):
         description="Set target guild ID",
         opt_type=interactions.OptionType.STRING,
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def config(
         self,
         ctx: interactions.SlashContext,
@@ -1332,60 +1359,32 @@ class Replica(interactions.Extension):
     # Export Command
 
     @module_base.subcommand(
-        sub_cmd_name=interactions.LocalisedName(
-            default_locale="english_us",
-            english_us="export",
-            chinese_china="导出",
-            chinese_taiwan="匯出",
-        ),
-        sub_cmd_description=interactions.LocalisedDesc(
-            default_locale="english_us",
-            english_us="Export files from the extension directory",
-            chinese_china="从扩展目录导出文件",
-            chinese_taiwan="從擴充目錄匯出檔案",
-        ),
+        sub_cmd_name="export",
+        sub_cmd_description="Export files from the extension directory",
     )
     @interactions.slash_option(
-        name=interactions.LocalisedName(
-            default_locale="english_us",
-            english_us="type",
-            chinese_china="类型",
-            chinese_taiwan="類型",
-        ),
-        description=interactions.LocalisedDesc(
-            default_locale="english_us",
-            english_us="Type of files to export",
-            chinese_china="要导出的文件类型",
-            chinese_taiwan="要匯出的檔案類型",
-        ),
+        name="type",
+        description="Type of files to export",
         required=True,
         opt_type=interactions.OptionType.STRING,
         autocomplete=True,
         argument_name="file_type",
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def debug_export(
         self, ctx: interactions.SlashContext, file_type: str
     ) -> None:
         await ctx.defer(ephemeral=True)
         filename: str = ""
-        locale = ctx.locale or "default"
 
         if not os.path.exists(BASE_DIR):
-            error_messages = {
-                "default": "Extension directory does not exist.",
-                "chinese_china": "扩展目录不存在。",
-                "chinese_taiwan": "擴充目錄不存在。",
-            }
-            await ctx.send(error_messages.get(locale, error_messages["default"]))
+            await ctx.send("Extension directory does not exist.")
             return None
 
         if file_type != "all" and not os.path.isfile(os.path.join(BASE_DIR, file_type)):
-            error_messages = {
-                "default": f"File `{file_type}` does not exist in the extension directory.",
-                "chinese_china": f"文件 `{file_type}` 在扩展目录中不存在。",
-                "chinese_taiwan": f"檔案 `{file_type}` 在擴充目錄中不存在。",
-            }
-            await ctx.send(error_messages.get(locale, error_messages["default"]))
+            await ctx.send(
+                f"File `{file_type}` does not exist in the extension directory."
+            )
             return None
         try:
             async with aiofiles.tempfile.NamedTemporaryFile(
@@ -1402,61 +1401,29 @@ class Replica(interactions.Extension):
                 )
 
             if not os.path.exists(filename):
-                error_messages = {
-                    "default": "Failed to create archive file.",
-                    "chinese_china": "创建归档文件失败。",
-                    "chinese_taiwan": "建立壓縮檔案失敗。",
-                }
-                await ctx.send(error_messages.get(locale, error_messages["default"]))
+                await ctx.send("Failed to create archive file.")
                 return None
 
             file_size = os.path.getsize(filename)
             if file_size > 8_388_608:
-                error_messages = {
-                    "default": "Archive file is too large to send (>8MB).",
-                    "chinese_china": "归档文件太大，无法发送（>8MB）。",
-                    "chinese_taiwan": "壓縮檔案太大，無法發送（>8MB）。",
-                }
-                await ctx.send(error_messages.get(locale, error_messages["default"]))
+                await ctx.send("Archive file is too large to send (>8MB).")
                 return None
-            success_messages = {
-                "default": (
+
+            await ctx.send(
+                (
                     "All extension files attached."
                     if file_type == "all"
                     else f"File `{file_type}` attached."
                 ),
-                "chinese_china": (
-                    "已附加所有扩展文件。"
-                    if file_type == "all"
-                    else f"已附加文件 `{file_type}`。"
-                ),
-                "chinese_taiwan": (
-                    "已附加所有擴充檔案。"
-                    if file_type == "all"
-                    else f"已附加檔案 `{file_type}`。"
-                ),
-            }
-            await ctx.send(
-                success_messages.get(locale, success_messages["default"]),
                 files=[interactions.File(filename)],
             )
 
         except PermissionError:
             logger.error(f"Permission denied while exporting {file_type}")
-            error_messages = {
-                "default": "Permission denied while accessing files.",
-                "chinese_china": "访问文件时权限被拒绝。",
-                "chinese_taiwan": "存取檔案時權限被拒絕。",
-            }
-            await ctx.send(error_messages.get(locale, error_messages["default"]))
+            await ctx.send("Permission denied while accessing files.")
         except Exception as e:
             logger.error(f"Error exporting {file_type}: {e}", exc_info=True)
-            error_messages = {
-                "default": f"An error occurred while exporting {file_type}: {str(e)}",
-                "chinese_china": f"导出 {file_type} 时发生错误：{str(e)}",
-                "chinese_taiwan": f"匯出 {file_type} 時發生錯誤：{str(e)}",
-            }
-            await ctx.send(error_messages.get(locale, error_messages["default"]))
+            await ctx.send(f"An error occurred while exporting {file_type}: {str(e)}")
         finally:
             if filename and os.path.exists(filename):
                 try:
@@ -1511,6 +1478,7 @@ class Replica(interactions.Extension):
         description="Invite duration in hours (default: 24, max: 168)",
         opt_type=interactions.OptionType.INTEGER,
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def generate_invite(
         self, ctx: interactions.SlashContext, server: str, duration: int = 24
     ) -> None:
@@ -1612,13 +1580,14 @@ class Replica(interactions.Extension):
         required=True,
         autocomplete=True,
     )
+    @interactions.check(interactions.has_id(1268909926458064991))
     async def delete_server(self, ctx: interactions.SlashContext, server: str) -> None:
         await ctx.defer(ephemeral=True)
 
         try:
             target_guild = await self.bot.fetch_guild(server)
 
-            # await target_guild.delete()
+            await target_guild.delete()
 
             await ctx.send(
                 f"Successfully deleted server: {target_guild.name}", ephemeral=True
